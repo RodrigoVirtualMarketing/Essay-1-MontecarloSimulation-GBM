@@ -31,7 +31,41 @@ Para dicha tarea es necesario armarse de un algoritmo con 4 responsabilidades:
 La implementación se apoya en el ecosistema científico de Python: pandas para el gobierno de datos, numpy para el cómputo vectorial, y scipy.stats para la modelización de funciones de densidad normal. La capa visual se gestiona mediante matplotlib, permitiendo una interpretación intuitiva de la varianza simulada.
 
 ### RESULTADOS
-El proyecto está diseñado para ser modular. El usuario puede orquestar la simulación modificando el ticker del activo, ajustando la densidad de las simulaciones (num_simulations) o expandiendo el horizonte temporal (num_days) para observar la degradación de la certidumbre a largo plazo. Para el analisis de resultados, los precios finales de todas las simulaciones son computados para hallar la mediana, los intervalos de confianza e identificar la trayectoria de precio más probable. Las trayectorias de precio son graficadas para representar el rango de futuros precios potenciales.
+El proyecto está diseñado para ser modular. El usuario puede manejar la simulación cambiando la acción o empresa analizada, ajustando la cantidad de simulaciones (`num_simulations`) o ampliando el horizonte de días (`num_days`) para ver cómo se degrada la certidumbre a largo plazo. Para el análisis de resultados, se calculan los precios finales de todas las simulaciones para hallar la mediana, los intervalos de confianza y la trayectoria de precio más representativa. Luego esas trayectorias se grafican para mostrar el rango de precios futuros posibles.
+
+### FLUJO DE DATOS
+En la sección de un ticker, la data representa la historia de precios ajustados de una sola acción o empresa. El flujo es simple: descargar la serie histórica, separar el precio de cierre, medir su variación diaria mediante retornos y usar ese comportamiento observado para construir escenarios probables hacia adelante.
+
+En la sección de varias acciones, la data representa un grupo comparable de empresas tratadas con el mismo criterio estadístico. Cada empresa conserva su propia serie de cierres y su propia volatilidad observada; luego las simulaciones se corren por separado y los resultados se juntan para comparar rangos, medianas y trayectorias probables entre acciones.
+
+### MAPA DE VARIABLES
+La siguiente tabla conecta las variables principales del notebook con su papel dentro del flujo de datos y con lo que significan en el análisis.
+
+| Variable | Tipo | Dónde aparece | Qué representa | Qué aporta al análisis |
+| --- | --- | --- | --- | --- |
+| `START_DATE` | Tiempo | Notebook | Fecha desde la cual se descargan los datos históricos | Define cuánta historia entra al modelo |
+| `NUM_SIMULATIONS` | Cantidad | Notebook | Número de caminos simulados | Mientras más simulaciones haya, más sólido es el panorama estadístico |
+| `NUM_DAYS_SINGLE_TICKER` | Horizonte | Caso un ticker | Número de días simulados para una acción | Define cuánto se proyecta hacia adelante en el caso individual |
+| `NUM_DAYS_MULTIPLE_TICKERS` | Horizonte | Caso varios tickers | Número de días simulados para cada acción comparada | Permite comparar varias acciones bajo la misma ventana de tiempo |
+| `ticker` | Identificador | Caso un ticker | Código de la acción o empresa analizada | Define qué empresa alimenta toda la simulación individual |
+| `mis_tickers` | Conjunto de análisis | Caso varios tickers | Lista de acciones o empresas comparadas | Define qué empresas entran al análisis comparativo |
+| `df` | Data histórica | Caso un ticker | Tabla con precios históricos descargados de una acción | Es la base desde la cual salen los retornos y el precio actual |
+| `df2` | Data histórica conjunta | Caso varios tickers | Tabla con precios históricos de varias acciones | Permite separar y comparar cada serie dentro del mismo proceso |
+| `close_prices` | Serie base | Ambos casos | Serie de precios de cierre ajustados | Resume el comportamiento principal del precio |
+| `returns` | Serie derivada | Caso un ticker | Cambio porcentual diario del precio de cierre | Mide cómo se mueve la acción día a día |
+| `mu` | Promedio | Ambos casos | Promedio de retornos diarios | Resume la tendencia media observada en la data |
+| `sigma` | Volatilidad | Ambos casos | Desviación estándar de los retornos diarios | Mide qué tanto se dispersan los movimientos del precio |
+| `last_price` | Punto de partida | Ambos casos | Último precio de cierre observado | Es el precio desde el cual arrancan las simulaciones |
+| `simulation_df` | Resultado bruto | Ambos casos | Matriz con todas las trayectorias simuladas | Guarda todos los caminos posibles generados por el modelo |
+| `final_prices` | Resultado final | Ambos casos | Último precio de cada simulación | Sirve para estudiar rangos, percentiles y distribución final |
+| `median_final_price` / `median_final_prices` | Resumen | Ambos casos | Mediana de los precios finales simulados | Da un punto central más robusto que el promedio |
+| `most_likely_price_index` | Selector | Ambos casos | Posición de la trayectoria final más cercana a la mediana | Ayuda a escoger un camino representativo |
+| `most_likely_path` / `most_likely_price_simulation` | Trayectoria representativa | Ambos casos | Camino simulado cuya salida final queda más cerca de la mediana | Sirve para mostrar visualmente el escenario central |
+| `all_ticker_simulation_dfs` | Contenedor | Caso varios tickers | Diccionario con simulaciones por acción | Guarda todos los resultados por empresa para revisarlos después |
+| `all_ticker_most_likely_prices` | Resumen comparativo | Caso varios tickers | Precio final representativo por acción | Facilita la comparación directa entre empresas |
+| `all_ticker_median_final_prices` | Resumen comparativo | Caso varios tickers | Mediana final por acción | Permite comparar el centro de cada distribución |
+| `results` | Lista intermedia | Caso varios tickers | Lista de resultados resumidos | Prepara la salida para mostrarla en forma de tabla |
+| `results_df` | Tabla final | Caso varios tickers | DataFrame final de comparación | Presenta los resultados principales de forma compacta |
 
 ### REFERENCIAS: {
     https://youtu.be/fO-lGzZADVU , 14 minute video that inspired this python project.
