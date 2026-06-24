@@ -1,73 +1,117 @@
-"El código fuente de este proyecto está bajo licencia MIT. Sin embargo, el texto del ensayo, las explicaciones, los gráficos y la estructura del curso están protegidos por derechos de autor. No se permite la reproducción, distribución o venta de este material sin permiso explícito del autor."
+# Monte Carlo GBM Quant Report
 
-# Finance and Statistics / Monte Carlo Simulation Engine / Stochastic Modeling via GBM
+Motor de simulacion Monte Carlo para acciones. El objetivo no es adivinar un precio exacto, sino construir un mapa de escenarios: centro, rango probable, riesgo de cola y estabilidad del modelo.
 
-#### Abstract
-Este repositorio implementa un motor de Simulación de Monte Carlo diseñado para la estimación de trayectorias potenciales en activos de renta variable. Partiendo de la premisa epistemológica de que la predicción determinista es una falacia en sistemas complejos, este proyecto desplaza el enfoque hacia la cuantificación de la incertidumbre. El objetivo no es señalar un precio futuro único, sino modelar una distribución de densidades que revele el espectro de resultados probables basados en la volatilidad histórica y la deriva del activo.
+El proyecto tiene dos formas de uso:
 
-**Palabras Clave: _simulación montecarlo, movimiento browniano geométrico, estimar vs predecir_**
+- `monte_carlo_simulatio_proyect.py`: motor principal. Descarga data, simula escenarios y genera un informe PDF.
+- `MONTE_CARLO_SIMULATIO_PROYECT.ipynb`: notebook de uso guiado para revisar el flujo y ejecutar el motor paso a paso.
 
-### INTRODUCCIÓN
-Sostengo la convicción de que "predecir" es un término inapropiado; en su defecto el concepto más preciso es estimar. La literatura sobre sistemas y modelos acuerda que lo posible es estimar el comportamiento agregado de un conjunto de variables o eventos aleatorios independientes mas no predecir de manera determinista.
+## Que Produce
 
-Herramientas como las simulaciones de Monte Carlo permiten estimar un valor razonable de un activo mediante la simulación de miles de trayectorias posibles, extrayendo el promedio como métrica de referencia. Por otro lado, los modelos ocultos de Markov se utilizan para inferir estados. Observando patrones en los datos observados. De manera que el proposito verdadero de modelar es proporcionar un marco informado para la toma decisiones bajo incertidumbre cuantificando una ventaja estadistica.
+El script genera:
 
-### MARCO TEÓRICO
-Bajo esta óptica, las generalizaciones dejan de ser etiquetas para transformarse en estimaciones de comportamiento agregado. No pretendemos describir la acción individual final, sino estimar la respuesta del sistema basándonos en sus patrones recurrentes.
+```text
+outputs/monte_carlo_quant_report.pdf
+```
 
-Esta distinción es crucial para no caer en la trampa del relativismo. A menudo se confunde la ausencia de una verdad absoluta con la falta de una estructura objetiva; sin embargo, técnicamente no nos enfrentamos a una "verdad relativa", sino a una incerteza inherente. La realidad objetiva no se manifiesta en el evento único que el humano intenta "predecir", sino en la consistencia de las leyes que permiten su estimación. En este contexto, la subjetividad no es un punto de vista válido, sino simplemente el ruido en la medición de un fenómeno que opera independientemente del observador.
+El PDF contiene:
 
-La prueba irrefutable de esta mecánica subyacente reside en la estabilidad de las distribuciones. La evidencia de lo real no se encuentra en la capacidad de adivinar el futuro, sino en la precisión con la que podemos calcular el margen de error y la dispersión. Es la consistencia del azar, este motor que genera grandes volúmenes de resultados probables, lo que confirma que existe una estructura sólida debajo del caos aparente.
+- Portada con lectura ejecutiva.
+- Tabla consolidada por accion.
+- Ranking de cambio mediano contra precio actual.
+- Ranking de riesgo de cola usando `CVaR 5%`.
+- Pagina por accion con trayectorias simuladas y distribucion final.
 
-### MARCO METODOLÓGICO
-Debemos entender los fenómenos como mecánica sin narrativa. Los eventos no son una cuestión de apreciación artística o interpretación moral, sino transiciones de estado en un sistema físico o biológico. Mientras que la "predicción" es una narrativa humana —un intento de imponer orden y sentido mediante el lenguaje—, la estimación estocástica trata al fenómeno por lo que es: una causalidad mecánica. Nuestra capacidad de análisis se limita, por tanto, a cartografiar la probabilidad de una ocurrencia dentro de un espectro de posibilidades, despojando al evento de su historia y devolviéndole su naturaleza de proceso.
+## Enfoque Quant
 
-Para dicha tarea es necesario armarse de un algoritmo con 4 responsabilidades:
-1. Extracción y saneamiento de datos historicos (OHLCV) usando una libreria externa (yfinance, interactive brokers)
-2. Cálculo de la media logarítmica ($\mu$) y la desviación estándar ($\sigma$) de los retornos diarios para definir el perfil de riesgo-retorno del activo.
-3. Ejecución de $n$ simulaciones (ej. 10,000 iteraciones) sobre un horizonte temporal definido. El motor utiliza el Movimiento Browniano Geométrico (GBM), asumiendo que los cambios en el precio siguen una distribución log-normal, lo que permite capturar la naturaleza estocástica del mercado.
-4. Procesamiento de los resultados finales.
+El flujo sigue esta regla:
 
-La implementación se apoya en el ecosistema científico de Python: pandas para el gobierno de datos, numpy para el cómputo vectorial, y scipy.stats para la modelización de funciones de densidad normal. La capa visual se gestiona mediante matplotlib, permitiendo una interpretación intuitiva de la varianza simulada.
+```text
+data -> regla -> prueba -> riesgo -> comparacion
+```
 
-### RESULTADOS
-El proyecto está diseñado para ser modular. El usuario puede manejar la simulación cambiando la acción o empresa analizada, ajustando la cantidad de simulaciones (`num_simulations`) o ampliando el horizonte de días (`num_days`) para ver cómo se degrada la certidumbre a largo plazo. Para el análisis de resultados, se calculan los precios finales de todas las simulaciones para hallar la mediana, los intervalos de confianza y la trayectoria de precio más representativa. Luego esas trayectorias se grafican para mostrar el rango de precios futuros posibles.
+- `data`: precios historicos descargados desde `yfinance`.
+- `regla`: retornos logaritmicos, media dinamica y volatilidad dinamica.
+- `prueba`: simulaciones Monte Carlo sobre un horizonte definido.
+- `riesgo`: rango 95%, `VaR 5%`, `CVaR 5%` y error de calibracion.
+- `comparacion`: todas las acciones pasan por la misma regla.
 
-### FLUJO DE DATOS
-En la sección de un ticker, la data representa la historia de precios ajustados de una sola acción o empresa. El flujo es simple: descargar la serie histórica, separar el precio de cierre, medir su variación diaria mediante retornos y usar ese comportamiento observado para construir escenarios probables hacia adelante.
+## Modelo Actual
 
-En la sección de varias acciones, la data representa un grupo comparable de empresas tratadas con el mismo criterio estadístico. Cada empresa conserva su propia serie de cierres y su propia volatilidad observada; luego las simulaciones se corren por separado y los resultados se juntan para comparar rangos, medianas y trayectorias probables entre acciones.
+El motor ya no usa una media y volatilidad fijas calculadas sobre toda la historia.
 
-### MAPA DE VARIABLES
-La siguiente tabla conecta las variables principales del notebook con su papel dentro del flujo de datos y con lo que significan en el análisis.
+Ahora usa:
 
-| Variable | Tipo | Dónde aparece | Qué representa | Qué aporta al análisis |
-| --- | --- | --- | --- | --- |
-| `START_DATE` | Tiempo | Notebook | Fecha desde la cual se descargan los datos históricos | Define cuánta historia entra al modelo |
-| `NUM_SIMULATIONS` | Cantidad | Notebook | Número de caminos simulados | Mientras más simulaciones haya, más sólido es el panorama estadístico |
-| `NUM_DAYS_SINGLE_TICKER` | Horizonte | Caso un ticker | Número de días simulados para una acción | Define cuánto se proyecta hacia adelante en el caso individual |
-| `NUM_DAYS_MULTIPLE_TICKERS` | Horizonte | Caso varios tickers | Número de días simulados para cada acción comparada | Permite comparar varias acciones bajo la misma ventana de tiempo |
-| `ticker` | Identificador | Caso un ticker | Código de la acción o empresa analizada | Define qué empresa alimenta toda la simulación individual |
-| `mis_tickers` | Conjunto de análisis | Caso varios tickers | Lista de acciones o empresas comparadas | Define qué empresas entran al análisis comparativo |
-| `df` | Data histórica | Caso un ticker | Tabla con precios históricos descargados de una acción | Es la base desde la cual salen los retornos y el precio actual |
-| `df2` | Data histórica conjunta | Caso varios tickers | Tabla con precios históricos de varias acciones | Permite separar y comparar cada serie dentro del mismo proceso |
-| `close_prices` | Serie base | Ambos casos | Serie de precios de cierre ajustados | Resume el comportamiento principal del precio |
-| `returns` | Serie derivada | Caso un ticker | Cambio porcentual diario del precio de cierre | Mide cómo se mueve la acción día a día |
-| `mu` | Promedio | Ambos casos | Promedio de retornos diarios | Resume la tendencia media observada en la data |
-| `sigma` | Volatilidad | Ambos casos | Desviación estándar de los retornos diarios | Mide qué tanto se dispersan los movimientos del precio |
-| `last_price` | Punto de partida | Ambos casos | Último precio de cierre observado | Es el precio desde el cual arrancan las simulaciones |
-| `simulation_df` | Resultado bruto | Ambos casos | Matriz con todas las trayectorias simuladas | Guarda todos los caminos posibles generados por el modelo |
-| `final_prices` | Resultado final | Ambos casos | Último precio de cada simulación | Sirve para estudiar rangos, percentiles y distribución final |
-| `median_final_price` / `median_final_prices` | Resumen | Ambos casos | Mediana de los precios finales simulados | Da un punto central más robusto que el promedio |
-| `most_likely_price_index` | Selector | Ambos casos | Posición de la trayectoria final más cercana a la mediana | Ayuda a escoger un camino representativo |
-| `most_likely_path` / `most_likely_price_simulation` | Trayectoria representativa | Ambos casos | Camino simulado cuya salida final queda más cerca de la mediana | Sirve para mostrar visualmente el escenario central |
-| `all_ticker_simulation_dfs` | Contenedor | Caso varios tickers | Diccionario con simulaciones por acción | Guarda todos los resultados por empresa para revisarlos después |
-| `all_ticker_most_likely_prices` | Resumen comparativo | Caso varios tickers | Precio final representativo por acción | Facilita la comparación directa entre empresas |
-| `all_ticker_median_final_prices` | Resumen comparativo | Caso varios tickers | Mediana final por acción | Permite comparar el centro de cada distribución |
-| `results` | Lista intermedia | Caso varios tickers | Lista de resultados resumidos | Prepara la salida para mostrarla en forma de tabla |
-| `results_df` | Tabla final | Caso varios tickers | DataFrame final de comparación | Presenta los resultados principales de forma compacta |
+- Media dinamica con filtro de Kalman.
+- Volatilidad EWMA para dar mas peso a la historia reciente.
+- Volatilidad implicita opcional desde opciones, cuando `yfinance` la entrega.
+- Choques `t-Student` para capturar colas mas pesadas que una normal.
+- Clustering de volatilidad tipo GARCH simple: shocks grandes elevan la volatilidad futura simulada.
 
-### REFERENCIAS: {
-    https://youtu.be/fO-lGzZADVU , 14 minute video that inspired this python project.
-    https://youtu.be/-4sf43SLL3A , for proof reading and revisioning.
-}
+## Variables Principales
+
+| Variable | Que controla | Uso practico |
+| --- | --- | --- |
+| `START_DATE` | Fecha inicial de descarga | Define cuanta historia entra al modelo |
+| `TICKERS` | Lista de acciones | Define el universo comparado |
+| `SINGLE_TICKER` | Accion individual | Sirve para pruebas de una sola accion |
+| `NUM_SIMULATIONS` | Cantidad de caminos simulados | Mas simulaciones reducen ruido estadistico |
+| `NUM_DAYS_SINGLE_TICKER` | Horizonte individual | Dias simulados para una accion |
+| `NUM_DAYS_MULTIPLE_TICKERS` | Horizonte comparativo | Dias simulados para varias acciones |
+| `ROLLING_WINDOW` | Ventana reciente | Base para varianza de largo plazo |
+| `EWMA_LAMBDA` | Peso de volatilidad reciente | Controla sensibilidad a cambios de regimen |
+| `STUDENT_T_DF` | Grados de libertad t-Student | Menor valor implica colas mas pesadas |
+| `VAR_LEVEL` | Nivel de cola | Define el percentil usado para VaR y CVaR |
+| `REPORT_PATH` | Ruta del PDF | Define donde se guarda el informe |
+
+## Metricas Del Reporte
+
+| Metrica | Lectura directa |
+| --- | --- |
+| `Precio actual` | Ultimo cierre disponible |
+| `Mediana simulada` | Centro de los precios finales simulados |
+| `Piso 95%` | Parte baja del rango central |
+| `Techo 95%` | Parte alta del rango central |
+| `Cambio % vs actual` | Diferencia entre mediana simulada y precio actual |
+| `VaR 5%` | Perdida minima al entrar en el peor 5% de escenarios |
+| `CVaR 5%` | Perdida promedio dentro del peor 5% |
+| `Sigma usada diaria` | Volatilidad diaria usada por el motor |
+| `Error calibracion` | Alerta de inestabilidad reciente en media y volatilidad |
+
+## Como Ejecutar
+
+Instala dependencias:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install pandas numpy matplotlib scipy seaborn yfinance jupyter
+```
+
+Ejecuta el motor:
+
+```bash
+python monte_carlo_simulatio_proyect.py
+```
+
+El progreso se muestra con logger:
+
+```text
+01:37:02 | INFO | AAPL | Simulation progress 50%
+01:37:03 | INFO | PDF report complete | path=outputs/monte_carlo_quant_report.pdf
+```
+
+## Como Leer El Resultado
+
+Una accion con mediana positiva pero `CVaR 5%` muy negativo puede tener upside, pero tambien cola de perdida fuerte.
+
+Una accion con `Error calibracion` alto esta en una zona menos estable: la media o la volatilidad reciente estan cambiando rapido.
+
+El informe sirve para comparar escenarios bajo incertidumbre. No reemplaza decision de inversion, control de riesgo ni validacion fuera de muestra.
+
+## Referencias
+
+- QUANT GUILD / Roman: [How to Quant Trade in 3 Minutes](https://youtu.be/mZLNzqDZHbA)
+- QUANT GUILD / Roman: [Time Series Analysis for Quant Finance](https://youtu.be/JwqjuUnR8OY)
+- Video base del proyecto: <https://youtu.be/fO-lGzZADVU>
