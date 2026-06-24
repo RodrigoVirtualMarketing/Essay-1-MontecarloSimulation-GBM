@@ -3,6 +3,7 @@ import logging
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
+import textwrap
 from typing import Optional
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
@@ -33,6 +34,21 @@ EWMA_LAMBDA = 0.94
 STUDENT_T_DF = 5
 VAR_LEVEL = 0.05
 REPORT_PATH = Path("outputs/monte_carlo_quant_report.pdf")
+REPORT_FIGSIZE = (11, 8.5)
+REPORT_DPI = 140
+REPORT_LEFT = 0.07
+REPORT_RIGHT = 0.95
+REPORT_TOP = 0.90
+REPORT_BOTTOM = 0.08
+REPORT_NAVY = "#17212B"
+REPORT_BLUE = "#2F5D8C"
+REPORT_RED = "#B23A3A"
+REPORT_GREEN = "#2F6F4E"
+REPORT_GRAY = "#6B7280"
+REPORT_LIGHT_GRAY = "#F2F4F7"
+REPORT_BORDER = "#D8DEE6"
+REPORT_TEXT = "#20242A"
+MAX_PATHS_TO_PLOT = 450
 
 
 def setup_logging(level=logging.INFO):
@@ -291,158 +307,456 @@ def summarize_results(results):
     return pd.DataFrame(rows).sort_values("Cambio % vs actual", ascending=False).reset_index(drop=True)
 
 
+def format_percent(value):
+    return f"{value:.2f}%"
+
+
+def format_price(value):
+    return f"{value:,.2f}"
+
+
+def classify_calibration_error(value):
+    if np.isnan(value):
+        return "sin lectura"
+    if value < 0.03:
+        return "estable"
+    if value < 0.08:
+        return "vigilar"
+    return "inestable"
+
+
+def classify_tail_risk(cvar_return):
+    if cvar_return <= -0.12:
+        return "riesgo alto"
+    if cvar_return <= -0.06:
+        return "riesgo medio"
+    return "riesgo controlado"
+
+
+def investor_diagnosis(row):
+    change = row["Cambio % vs actual"]
+    cvar = row["CVaR 5%"]
+    calibration = row["Error calibracion"]
+
+    if change > 0 and cvar > -8 and calibration < 0.08:
+        return "Escenario favorable, riesgo de cola manejable."
+    if change > 0 and cvar <= -8:
+        return "Potencial positivo, pero la caida mala pesa."
+    if change <= 0 and cvar <= -8:
+        return "Escenario debil y cola de perdida exigente."
+    if calibration >= 0.08:
+        return "Modelo inestable: usar menor confianza."
+    return "Escenario mixto: revisar posicion y horizonte."
+
+
+def investor_diagnosis_short(row):
+    change = row["Cambio % vs actual"]
+    cvar = row["CVaR 5%"]
+    calibration = row["Error calibracion"]
+
+    if calibration >= 0.08:
+        return "Baja confianza"
+    if change > 0 and cvar > -8:
+        return "Favorable"
+    if change > 0 and cvar <= -8:
+        return "Potencial con cola"
+    if change <= 0 and cvar <= -8:
+        return "Debil"
+    return "Mixto"
+
+
+def add_wrapped_text(fig, x, y, text, chars=58, fontsize=9, color=REPORT_TEXT, line_height=0.023, weight=None):
+    for index, line in enumerate(textwrap.wrap(text, width=chars)):
+        fig.text(x, y - index * line_height, line, fontsize=fontsize, color=color, weight=weight)
+
+
+def make_report_figure():
+    fig = plt.figure(figsize=REPORT_FIGSIZE, dpi=REPORT_DPI)
+    fig.patch.set_facecolor("white")
+    return fig
+
+
+def add_report_header(fig, title, subtitle=None, section="Monte Carlo GBM"):
+    fig.text(REPORT_LEFT, 0.965, section.upper(), fontsize=7.5, color=REPORT_GRAY, weight="bold")
+    fig.text(REPORT_LEFT, 0.925, title, fontsize=17, color=REPORT_NAVY, weight="bold")
+    if subtitle:
+        fig.text(REPORT_LEFT, 0.895, subtitle, fontsize=9.5, color=REPORT_GRAY)
+    fig.add_artist(
+        plt.Line2D(
+            [REPORT_LEFT, REPORT_RIGHT],
+            [0.875, 0.875],
+            transform=fig.transFigure,
+            color=REPORT_BORDER,
+            linewidth=0.8,
+        )
+    )
+
+
+def add_report_footer(fig, page_label):
+    footer = (
+        f"{page_label} | Fuente: yfinance | Inicio data: {START_DATE} | "
+        f"{NUM_SIMULATIONS:,} simulaciones"
+    )
+    fig.add_artist(
+        plt.Line2D(
+            [REPORT_LEFT, REPORT_RIGHT],
+            [0.045, 0.045],
+            transform=fig.transFigure,
+            color=REPORT_BORDER,
+            linewidth=0.8,
+        )
+    )
+    fig.text(REPORT_LEFT, 0.025, footer, fontsize=7.5, color=REPORT_GRAY)
+
+
+def add_metric_card(fig, x, y, width, title, value, note="", accent=REPORT_BLUE):
+    card = plt.Rectangle(
+        (x, y),
+        width,
+        0.135,
+        transform=fig.transFigure,
+        facecolor=REPORT_LIGHT_GRAY,
+        edgecolor=REPORT_BORDER,
+        linewidth=0.8,
+    )
+    fig.add_artist(card)
+    fig.add_artist(
+        plt.Line2D(
+            [x, x],
+            [y, y + 0.135],
+            transform=fig.transFigure,
+            color=accent,
+            linewidth=3,
+        )
+    )
+    fig.text(x + 0.018, y + 0.096, title.upper(), fontsize=7.5, color=REPORT_GRAY, weight="bold")
+    fig.text(x + 0.018, y + 0.052, value, fontsize=17, color=REPORT_NAVY, weight="bold")
+    if note:
+        fig.text(x + 0.018, y + 0.022, note, fontsize=7.8, color=REPORT_GRAY)
+
+
+def add_text_block(fig, x, y, title, body, chars=52):
+    fig.text(x, y, title, fontsize=10.5, color=REPORT_NAVY, weight="bold")
+    add_wrapped_text(fig, x, y - 0.035, body, chars=chars, fontsize=8.8, color=REPORT_TEXT, line_height=0.023)
+
+
 def add_paths_plot(ax, result):
-    ax.plot(result.simulation_df, alpha=0.04, color="#4E79A7", linewidth=0.6)
+    path_count = result.simulation_df.shape[1]
+    if path_count > MAX_PATHS_TO_PLOT:
+        sample_indexes = np.linspace(0, path_count - 1, MAX_PATHS_TO_PLOT, dtype=int)
+        paths_to_plot = result.simulation_df[:, sample_indexes]
+    else:
+        paths_to_plot = result.simulation_df
+
+    ax.plot(paths_to_plot, alpha=0.08, color=REPORT_BLUE, linewidth=0.45)
     ax.plot(
         result.representative_path,
-        color="#C0392B",
+        color=REPORT_RED,
         linestyle="--",
         linewidth=2,
-        label="Trayectoria cercana a la mediana",
+        label="Camino central",
     )
-    ax.set_title(f"Escenarios de precio: {result.ticker}", loc="left", fontsize=12, fontweight="bold")
+    ax.set_title(f"Escenarios simulados: {result.ticker}", loc="left", fontsize=11, fontweight="bold", color=REPORT_NAVY)
     ax.set_xlabel("Dias")
     ax.set_ylabel("Precio")
-    ax.grid(True, alpha=0.25)
+    ax.grid(True, alpha=0.18)
+    ax.spines[["top", "right"]].set_visible(False)
     ax.legend(frameon=False, fontsize=8)
 
 
 def add_final_distribution_plot(ax, result):
-    sns.histplot(result.final_prices, bins=50, kde=True, color="#A8DADC", ax=ax)
-    ax.axvline(result.current_price, color="#2E7D32", linestyle=":", label=f"Actual: {result.current_price:.2f}")
+    sns.histplot(result.final_prices, bins=42, kde=True, color="#D9E6F2", edgecolor="white", ax=ax)
+    ax.axvline(result.current_price, color=REPORT_GREEN, linestyle=":", label=f"Actual: {result.current_price:.2f}")
     ax.axvline(
         result.median_final_price,
-        color="#C0392B",
+        color=REPORT_RED,
         linestyle="--",
         label=f"Mediana: {result.median_final_price:.2f}",
     )
-    ax.axvline(result.lower_bound, color="#6C757D", linestyle="-.", label=f"Piso 95%: {result.lower_bound:.2f}")
-    ax.axvline(result.upper_bound, color="#6C757D", linestyle="-.", label=f"Techo 95%: {result.upper_bound:.2f}")
-    ax.set_title(f"Distribucion final: {result.ticker}", loc="left", fontsize=12, fontweight="bold")
+    ax.axvline(result.lower_bound, color=REPORT_GRAY, linestyle="-.", label=f"Piso 95%: {result.lower_bound:.2f}")
+    ax.axvline(result.upper_bound, color=REPORT_GRAY, linestyle="-.", label=f"Techo 95%: {result.upper_bound:.2f}")
+    ax.set_title(f"Distribucion final: {result.ticker}", loc="left", fontsize=11, fontweight="bold", color=REPORT_NAVY)
     ax.set_xlabel("Precio final")
     ax.set_ylabel("Frecuencia")
-    ax.grid(True, alpha=0.25)
+    ax.grid(True, alpha=0.18)
+    ax.spines[["top", "right"]].set_visible(False)
     ax.legend(frameon=False, fontsize=8)
 
 
 def add_cover_page(pdf, summary_df):
-    fig = plt.figure(figsize=(11, 8.5))
-    fig.patch.set_facecolor("white")
-    fig.text(0.08, 0.82, "Monte Carlo GBM", fontsize=24, fontweight="bold", color="#111111")
-    fig.text(0.08, 0.76, "Informe quant de escenarios y riesgo", fontsize=14, color="#333333")
-    fig.text(
-        0.08,
-        0.68,
-        (
-            f"Fuente: yfinance | Inicio data: {START_DATE} | "
-            f"Simulaciones: {NUM_SIMULATIONS:,} | Horizonte comparativo: {NUM_DAYS_MULTIPLE_TICKERS} dias"
-        ),
-        fontsize=10,
-        color="#555555",
+    fig = make_report_figure()
+    add_report_header(
+        fig,
+        "Informe quant de escenarios y riesgo",
+        "Lectura para inversionista: centro probable, rango, perdida mala y estabilidad del modelo.",
+        "Reporte ejecutivo",
     )
 
     best_row = summary_df.iloc[0]
     worst_tail_row = summary_df.sort_values("CVaR 5%").iloc[0]
     most_unstable_row = summary_df.sort_values("Error calibracion", ascending=False).iloc[0]
 
-    cards = [
-        ("Mejor mediana vs actual", best_row["Ticker"], f"{best_row['Cambio % vs actual']:.2f}%"),
-        ("Peor cola CVaR 5%", worst_tail_row["Ticker"], f"{worst_tail_row['CVaR 5%']:.2f}%"),
-        ("Mayor error calibracion", most_unstable_row["Ticker"], f"{most_unstable_row['Error calibracion']:.4f}"),
+    add_metric_card(
+        fig,
+        0.07,
+        0.67,
+        0.27,
+        "Mejor centro",
+        str(best_row["Ticker"]),
+        f"Mediana vs actual: {format_percent(best_row['Cambio % vs actual'])}",
+        REPORT_GREEN if best_row["Cambio % vs actual"] >= 0 else REPORT_RED,
+    )
+    add_metric_card(
+        fig,
+        0.37,
+        0.67,
+        0.27,
+        "Peor perdida mala",
+        str(worst_tail_row["Ticker"]),
+        f"CVaR 5%: {format_percent(worst_tail_row['CVaR 5%'])}",
+        REPORT_RED,
+    )
+    add_metric_card(
+        fig,
+        0.67,
+        0.67,
+        0.27,
+        "Modelo mas fragil",
+        str(most_unstable_row["Ticker"]),
+        f"Error: {most_unstable_row['Error calibracion']:.4f}",
+        REPORT_BLUE,
+    )
+
+    add_text_block(
+        fig,
+        0.07,
+        0.49,
+        "Diagnostico del sistema",
+        (
+            "El motor no entrega una prediccion. Entrega una distribucion de escenarios. "
+            "Para invertir, la lectura practica es comparar si el centro compensa el riesgo "
+            "de cola y si el modelo esta estable."
+        ),
+        chars=62,
+    )
+    add_text_block(
+        fig,
+        0.55,
+        0.49,
+        "Regla de lectura",
+        (
+            "Una accion con mediana alta pero CVaR muy negativo puede tener potencial, "
+            "pero exige control de perdida. Si el error de calibracion sube, la confianza "
+            "en la hoja de ruta baja."
+        ),
+        chars=52,
+    )
+    fig.text(0.07, 0.26, "Universo analizado", fontsize=10.5, color=REPORT_NAVY, weight="bold")
+    fig.text(0.07, 0.22, ", ".join(summary_df["Ticker"].astype(str)), fontsize=18, color=REPORT_TEXT, weight="bold")
+    add_report_footer(fig, "Portada")
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def add_methodology_page(pdf):
+    fig = make_report_figure()
+    add_report_header(
+        fig,
+        "Como leer el modelo",
+        "El reporte separa oportunidad, dispersion, perdida mala y estabilidad de parametros.",
+        "Metodologia",
+    )
+
+    principles = [
+        ("Centro", "La mediana muestra el punto medio de las simulaciones. No es precio objetivo."),
+        ("Rango", "Piso 95% y techo 95% muestran donde cae la mayor parte de escenarios."),
+        ("Perdida mala", "VaR y CVaR resumen que pasa en el peor 5% de escenarios."),
+        ("Regimen", "Kalman y EWMA dan mas peso a la informacion reciente."),
+        ("Fragilidad", "Error de calibracion alto significa que media o volatilidad estan cambiando rapido."),
     ]
 
-    for index, (title, ticker, value) in enumerate(cards):
-        x_position = 0.08 + index * 0.29
-        fig.text(x_position, 0.55, title, fontsize=9, color="#555555")
-        fig.text(x_position, 0.49, ticker, fontsize=20, fontweight="bold", color="#111111")
-        fig.text(x_position, 0.44, value, fontsize=16, color="#C0392B")
+    y_position = 0.74
+    for index, (title, body) in enumerate(principles, start=1):
+        fig.text(0.08, y_position, f"{index:02d}", fontsize=13, color=REPORT_BLUE, weight="bold")
+        fig.text(0.14, y_position, title, fontsize=11, color=REPORT_NAVY, weight="bold")
+        add_wrapped_text(fig, 0.14, y_position - 0.035, body, chars=58, fontsize=9.1, color=REPORT_TEXT)
+        y_position -= 0.12
 
-    fig.text(
-        0.08,
-        0.30,
-        "Lectura: el reporte no busca acertar un precio. Ordena escenarios, riesgo de cola y estabilidad del modelo.",
-        fontsize=11,
-        color="#333333",
+    add_text_block(
+        fig,
+        0.58,
+        0.74,
+        "Decision practica",
+        (
+            "Comprar, mantener o descartar no sale de una sola metrica. La decision razonable "
+            "cruza centro esperado, perdida mala y estabilidad del modelo."
+        ),
+        chars=47,
     )
-    fig.text(
-        0.08,
-        0.25,
-        "Metricas clave: mediana simulada, rango 95%, VaR 5%, CVaR 5%, sigma usada y error de calibracion.",
-        fontsize=11,
-        color="#333333",
+    add_text_block(
+        fig,
+        0.58,
+        0.55,
+        "Uso correcto",
+        (
+            "El informe sirve para priorizar revision. No reemplaza tesis fundamental, sizing, "
+            "liquidez, costos ni validacion fuera de muestra."
+        ),
+        chars=47,
     )
-    pdf.savefig(fig, bbox_inches="tight")
+    add_report_footer(fig, "Metodologia")
+    pdf.savefig(fig)
     plt.close(fig)
 
 
 def add_summary_table_page(pdf, summary_df):
     display_df = summary_df.copy()
-    numeric_columns = display_df.select_dtypes(include=[np.number]).columns
-    display_df[numeric_columns] = display_df[numeric_columns].round(4)
+    display_df["Cola"] = display_df["CVaR 5%"].apply(lambda value: classify_tail_risk(value / 100))
+    display_df["Estabilidad"] = display_df["Error calibracion"].apply(classify_calibration_error)
+    display_df["Lectura"] = display_df.apply(investor_diagnosis_short, axis=1)
+    display_df = display_df[
+        [
+            "Ticker",
+            "Precio actual",
+            "Mediana simulada",
+            "Cambio % vs actual",
+            "CVaR 5%",
+            "Estabilidad",
+            "Cola",
+            "Lectura",
+        ]
+    ]
+    display_df["Precio actual"] = display_df["Precio actual"].map(format_price)
+    display_df["Mediana simulada"] = display_df["Mediana simulada"].map(format_price)
+    display_df["Cambio % vs actual"] = display_df["Cambio % vs actual"].map(format_percent)
+    display_df["CVaR 5%"] = display_df["CVaR 5%"].map(format_percent)
 
-    fig, ax = plt.subplots(figsize=(11, 8.5))
+    fig = make_report_figure()
+    add_report_header(
+        fig,
+        "Resumen consolidado",
+        "Ranking comparable bajo la misma regla de simulacion.",
+        "Resultados",
+    )
+    ax = fig.add_axes([0.055, 0.18, 0.89, 0.62])
     ax.axis("off")
-    ax.set_title("Resumen consolidado", loc="left", fontsize=16, fontweight="bold", pad=18)
     table = ax.table(
         cellText=display_df.values,
         colLabels=display_df.columns,
-        loc="center",
+        loc="upper center",
         cellLoc="center",
         colLoc="center",
+        bbox=[0, 0.26, 1, 0.52],
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(7.5)
-    table.scale(1, 1.35)
+    table.set_fontsize(7.0)
+    column_widths = [0.07, 0.11, 0.13, 0.12, 0.10, 0.12, 0.13, 0.22]
 
     for (row, column), cell in table.get_celld().items():
-        cell.set_edgecolor("#DDDDDD")
+        cell.set_edgecolor(REPORT_BORDER)
+        cell.set_linewidth(0.55)
+        if column < len(column_widths):
+            cell.set_width(column_widths[column])
         if row == 0:
-            cell.set_facecolor("#111111")
+            cell.set_facecolor(REPORT_NAVY)
             cell.set_text_props(color="white", weight="bold")
         else:
-            cell.set_facecolor("#F7F7F7" if row % 2 == 0 else "white")
+            cell.set_facecolor(REPORT_LIGHT_GRAY if row % 2 == 0 else "white")
+            if column in (3, 4):
+                raw_value = summary_df.iloc[row - 1, summary_df.columns.get_loc("Cambio % vs actual" if column == 3 else "CVaR 5%")]
+                cell.set_text_props(color=REPORT_GREEN if raw_value >= 0 else REPORT_RED)
 
-    pdf.savefig(fig, bbox_inches="tight")
+    add_report_footer(fig, "Resumen")
+    pdf.savefig(fig)
     plt.close(fig)
 
 
 def add_risk_return_page(pdf, summary_df):
-    fig, axes = plt.subplots(1, 2, figsize=(11, 8.5))
+    fig = make_report_figure()
+    add_report_header(
+        fig,
+        "Decision bajo incertidumbre",
+        "El centro se compara contra la perdida promedio en escenarios malos.",
+        "Diagnostico",
+    )
+    axes = [
+        fig.add_axes([0.08, 0.18, 0.38, 0.62]),
+        fig.add_axes([0.56, 0.18, 0.38, 0.62]),
+    ]
     sorted_return = summary_df.sort_values("Cambio % vs actual")
     sorted_tail = summary_df.sort_values("CVaR 5%")
 
-    axes[0].barh(sorted_return["Ticker"], sorted_return["Cambio % vs actual"], color="#4E79A7")
-    axes[0].axvline(0, color="#111111", linewidth=0.8)
-    axes[0].set_title("Cambio mediano vs precio actual", loc="left", fontsize=12, fontweight="bold")
+    return_colors = [REPORT_GREEN if value >= 0 else REPORT_RED for value in sorted_return["Cambio % vs actual"]]
+    axes[0].barh(sorted_return["Ticker"], sorted_return["Cambio % vs actual"], color=return_colors)
+    axes[0].axvline(0, color=REPORT_NAVY, linewidth=0.8)
+    axes[0].set_title("Centro vs precio actual", loc="left", fontsize=11, fontweight="bold", color=REPORT_NAVY)
     axes[0].set_xlabel("%")
-    axes[0].grid(axis="x", alpha=0.25)
+    axes[0].grid(axis="x", alpha=0.18)
+    axes[0].spines[["top", "right"]].set_visible(False)
 
-    axes[1].barh(sorted_tail["Ticker"], sorted_tail["CVaR 5%"], color="#C0392B")
-    axes[1].axvline(0, color="#111111", linewidth=0.8)
-    axes[1].set_title("Perdida media en el peor 5% (CVaR)", loc="left", fontsize=12, fontweight="bold")
+    axes[1].barh(sorted_tail["Ticker"], sorted_tail["CVaR 5%"], color=REPORT_RED)
+    axes[1].axvline(0, color=REPORT_NAVY, linewidth=0.8)
+    axes[1].set_title("Perdida promedio en peor 5%", loc="left", fontsize=11, fontweight="bold", color=REPORT_NAVY)
     axes[1].set_xlabel("%")
-    axes[1].grid(axis="x", alpha=0.25)
+    axes[1].grid(axis="x", alpha=0.18)
+    axes[1].spines[["top", "right"]].set_visible(False)
 
-    fig.suptitle("Decision bajo incertidumbre", x=0.08, y=0.96, ha="left", fontsize=16, fontweight="bold")
-    fig.tight_layout(rect=[0, 0, 1, 0.93])
-    pdf.savefig(fig, bbox_inches="tight")
+    add_report_footer(fig, "Diagnostico")
+    pdf.savefig(fig)
     plt.close(fig)
 
 
 def add_ticker_page(pdf, result):
-    fig, axes = plt.subplots(2, 1, figsize=(11, 8.5), gridspec_kw={"height_ratios": [1, 1]})
+    fig = make_report_figure()
+    change = ((result.median_final_price / result.current_price) - 1) * 100
+    add_report_header(
+        fig,
+        f"Ficha de accion: {result.ticker}",
+        "Escenarios simulados, distribucion final y lectura de riesgo.",
+        "Detalle por empresa",
+    )
+
+    add_metric_card(fig, 0.07, 0.73, 0.20, "Precio actual", format_price(result.current_price), "", REPORT_BLUE)
+    add_metric_card(
+        fig,
+        0.29,
+        0.73,
+        0.20,
+        "Mediana",
+        format_price(result.median_final_price),
+        f"{format_percent(change)} vs actual",
+        REPORT_GREEN if change >= 0 else REPORT_RED,
+    )
+    add_metric_card(
+        fig,
+        0.51,
+        0.73,
+        0.20,
+        "CVaR 5%",
+        format_percent(result.cvar_5_return * 100),
+        classify_tail_risk(result.cvar_5_return),
+        REPORT_RED,
+    )
+    add_metric_card(
+        fig,
+        0.73,
+        0.73,
+        0.20,
+        "Estabilidad",
+        classify_calibration_error(result.calibration_error),
+        f"Error: {result.calibration_error:.4f}",
+        REPORT_BLUE,
+    )
+
+    axes = [
+        fig.add_axes([0.07, 0.40, 0.86, 0.25]),
+        fig.add_axes([0.07, 0.10, 0.86, 0.22]),
+    ]
     add_paths_plot(axes[0], result)
     add_final_distribution_plot(axes[1], result)
 
-    metrics = (
-        f"Actual: {result.current_price:.2f} | Mediana: {result.median_final_price:.2f} | "
-        f"VaR 5%: {result.var_5_return * 100:.2f}% | CVaR 5%: {result.cvar_5_return * 100:.2f}% | "
-        f"Error calibracion: {result.calibration_error:.4f}"
-    )
-    fig.suptitle(result.ticker, x=0.08, y=0.98, ha="left", fontsize=18, fontweight="bold")
-    fig.text(0.08, 0.94, metrics, fontsize=9, color="#333333")
-    fig.tight_layout(rect=[0, 0, 1, 0.92])
-    pdf.savefig(fig, bbox_inches="tight")
+    add_report_footer(fig, f"Detalle {result.ticker}")
+    pdf.savefig(fig)
     plt.close(fig)
 
 
@@ -452,6 +766,8 @@ def create_pdf_report(results, summary_df, output_path=REPORT_PATH):
     with PdfPages(output_path) as pdf:
         logger.info("PDF page | cover")
         add_cover_page(pdf, summary_df)
+        logger.info("PDF page | methodology")
+        add_methodology_page(pdf)
         logger.info("PDF page | consolidated table")
         add_summary_table_page(pdf, summary_df)
         logger.info("PDF page | risk-return")

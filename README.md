@@ -1,13 +1,70 @@
-# Monte Carlo GBM Quant Report
+# Finance and Statistics / Monte Carlo Simulation Engine / Stochastic Modeling via GBM
 
-Motor de simulacion Monte Carlo para acciones. El objetivo no es adivinar un precio exacto, sino construir un mapa de escenarios: centro, rango probable, riesgo de cola y estabilidad del modelo.
+## Abstract
+
+Este repositorio implementa un motor de simulacion Monte Carlo para estimar trayectorias potenciales en acciones. Parte de una premisa clara: en sistemas complejos, la prediccion determinista es una mala promesa. El trabajo serio no consiste en decir "este sera el precio", sino en cuantificar incertidumbre, medir dispersion y construir una hoja de ruta probabilistica.
+
+El objetivo no es senalar un precio futuro unico. El objetivo es modelar una distribucion de resultados posibles que permita leer centro, rango, riesgo de cola y estabilidad del modelo. En castellano directo: no buscamos adivinar, buscamos estimar mejor.
+
+**Palabras clave:** simulacion Monte Carlo, movimiento browniano geometrico, estimar vs predecir, riesgo de cola, decisiones bajo incertidumbre.
+
+## Introduccion
+
+Sostengo que "predecir" es un termino impreciso para mercados. El concepto mas correcto es estimar. Una simulacion Monte Carlo permite construir miles de caminos posibles y observar que rangos aparecen con mas frecuencia. Esa lectura no elimina la incertidumbre; la ordena.
+
+El proposito real de modelar no es fabricar certeza. Es proporcionar un marco informado para tomar decisiones bajo incertidumbre, cuantificando si existe o no una ventaja estadistica razonable.
+
+En esta version, el proyecto mantiene la base GBM, pero refuerza el analisis con herramientas mas robustas: media dinamica, volatilidad reciente, volatilidad implicita cuando esta disponible, colas pesadas, persistencia de volatilidad, `VaR`, `CVaR` y error de calibracion.
+
+## Marco Teorico
+
+Bajo esta optica, las generalizaciones dejan de ser etiquetas y pasan a ser estimaciones de comportamiento agregado. No pretendemos describir la accion individual final. Buscamos estimar la respuesta del sistema usando patrones observados en la serie historica.
+
+La ausencia de certeza no significa ausencia de estructura. En mercados, lo real no aparece como un evento puntual que podamos adivinar, sino como una distribucion que podemos medir. La pregunta relevante no es "que va a pasar", sino "que rango parece razonable y que tan caro es equivocarse".
+
+La evidencia util esta en la dispersion, en el margen de error y en la estabilidad de las distribuciones. Si el modelo cambia demasiado rapido, el reporte debe advertirlo. Por eso se incluye `Error calibracion`: no como verdad absoluta, sino como senal de fragilidad reciente en media y volatilidad.
+
+## Marco Metodologico
+
+El proyecto trata el precio como una serie de tiempo. Cada cierre diario alimenta retornos logaritmicos. Esos retornos se usan para estimar el movimiento reciente del activo y simular escenarios futuros.
+
+El algoritmo tiene seis responsabilidades:
+
+1. Descargar y limpiar precios historicos con `yfinance`.
+2. Separar la serie de cierre ajustado por accion.
+3. Estimar media dinamica con filtro de Kalman.
+4. Estimar volatilidad dinamica con EWMA y, cuando sea posible, complementar con volatilidad implicita de opciones.
+5. Ejecutar simulaciones Monte Carlo con GBM, choques `t-Student` y persistencia de volatilidad.
+6. Procesar resultados en terminos de mediana, rango 95%, `VaR 5%`, `CVaR 5%` y error de calibracion.
+
+La implementacion usa `pandas` para datos, `numpy` para computo numerico, `scipy` para la distribucion `t-Student`, `yfinance` para precios/opciones y `matplotlib`/`seaborn` para el informe visual.
+
+## Resultado Esperado
+
+El resultado final no es "la respuesta correcta" del mercado. Es una hoja de ruta probabilistica. El usuario puede cambiar la accion, el universo de empresas, la cantidad de simulaciones o el horizonte temporal para observar como cambia el rango de escenarios.
+
+El output principal es un PDF minimalista con metricas de valor:
+
+- Centro: `Mediana simulada`.
+- Rango: `Piso 95%` y `Techo 95%`.
+- Riesgo de cola: `VaR 5%` y `CVaR 5%`.
+- Estabilidad: `Error calibracion`.
+- Comparacion: ranking entre acciones bajo la misma regla.
+
+## Flujo De Datos
+
+En una accion, la data representa la historia de precios ajustados de una empresa. El flujo es: descargar serie historica, separar cierre, calcular retornos, estimar media/volatilidad dinamica y simular escenarios.
+
+En varias acciones, la data representa un grupo comparable de empresas tratadas con el mismo criterio. Cada accion conserva su propia serie, su propia volatilidad y su propio riesgo de cola. Luego los resultados se consolidan para comparar centro, rango, perdida esperada en malos escenarios y estabilidad reciente.
+
+## Uso Del Proyecto
 
 El proyecto tiene dos formas de uso:
 
 - `monte_carlo_simulatio_proyect.py`: motor principal. Descarga data, simula escenarios y genera un informe PDF.
 - `MONTE_CARLO_SIMULATIO_PROYECT.ipynb`: notebook de uso guiado para revisar el flujo y ejecutar el motor paso a paso.
 
-## Que Produce
+## Que Produce El Motor
 
 El script genera:
 
@@ -23,7 +80,9 @@ El PDF contiene:
 - Ranking de riesgo de cola usando `CVaR 5%`.
 - Pagina por accion con trayectorias simuladas y distribucion final.
 
-## Enfoque Quant
+La presentacion del reporte esta estandarizada como informe ejecutivo: misma hoja, mismos margenes, mismo encabezado, mismo pie y misma jerarquia visual. La lectura esta pensada para un inversionista: primero oportunidad, luego perdida mala, luego estabilidad del modelo.
+
+## Enfoque Quant Operativo
 
 El flujo sigue esta regla:
 
@@ -37,7 +96,7 @@ data -> regla -> prueba -> riesgo -> comparacion
 - `riesgo`: rango 95%, `VaR 5%`, `CVaR 5%` y error de calibracion.
 - `comparacion`: todas las acciones pasan por la misma regla.
 
-## Modelo Actual
+## Modelo Actual En Codigo
 
 El motor ya no usa una media y volatilidad fijas calculadas sobre toda la historia.
 
@@ -107,6 +166,13 @@ El progreso se muestra con logger:
 Una accion con mediana positiva pero `CVaR 5%` muy negativo puede tener upside, pero tambien cola de perdida fuerte.
 
 Una accion con `Error calibracion` alto esta en una zona menos estable: la media o la volatilidad reciente estan cambiando rapido.
+
+El diagnostico del sistema debe leerse asi:
+
+- `Centro`: donde cae la mediana de los escenarios simulados.
+- `Rango`: cuanto se abre la distribucion de precios posibles.
+- `Perdida mala`: cuanto podria doler el peor 5% de escenarios.
+- `Estabilidad`: que tanta confianza merece la calibracion reciente.
 
 El informe sirve para comparar escenarios bajo incertidumbre. No reemplaza decision de inversion, control de riesgo ni validacion fuera de muestra.
 
