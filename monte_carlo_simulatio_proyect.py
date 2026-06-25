@@ -23,16 +23,20 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 logger = logging.getLogger(__name__)
 
 
-START_DATE = "1950-01-01"
+DATA_START_DATE = "2010-01-01"
+CALIBRATION_START_DATE = "2020-01-01"
+START_DATE = DATA_START_DATE
 SINGLE_TICKER = "AAPL"
 TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "PLTR"]
 NUM_SIMULATIONS = 10_000
 NUM_DAYS_SINGLE_TICKER = 252
 NUM_DAYS_MULTIPLE_TICKERS = 22
+LOOKBACK_DAYS = 756
 ROLLING_WINDOW = 252
 EWMA_LAMBDA = 0.94
 STUDENT_T_DF = 5
 VAR_LEVEL = 0.05
+CALIBRATION_ERROR_THRESHOLD = 0.08
 REPORT_PATH = Path("outputs/monte_carlo_quant_report.pdf")
 REPORT_FIGSIZE = (11, 8.5)
 REPORT_DPI = 140
@@ -65,14 +69,20 @@ def setup_logging(level=logging.INFO):
 class SimulationResult:
     ticker: str
     current_price: float
+    calibration_start_date: str
+    calibration_observations: int
     dynamic_mu: float
     dynamic_sigma: float
     implied_sigma: Optional[float]
     sigma_used: float
     calibration_error: float
+    circuit_breaker_status: str
+    rankable: bool
     simulation_df: np.ndarray
     final_prices: np.ndarray
     median_final_price: float
+    median_return: float
+    asymmetry_score: float
     representative_path: np.ndarray
     var_5_return: float
     cvar_5_return: float
@@ -109,6 +119,36 @@ def get_close_series(data, ticker):
 
 def get_log_returns(close_prices):
     return np.log(close_prices / close_prices.shift(1)).dropna()
+
+
+def get_calibration_prices(close_prices, calibration_start_date=CALIBRATION_START_DATE, lookback_days=LOOKBACK_DAYS):
+    calibration_prices = close_prices.loc[close_prices.index >= pd.Timestamp(calibration_start_date)].dropna()
+    if len(calibration_prices) > lookback_days + 1:
+        calibration_prices = calibration_prices.tail(lookback_days + 1)
+
+    if len(calibration_prices) < 30:
+        raise ValueError("Not enough calibration observations after applying the recent-regime window.")
+
+    return calibration_prices
+
+
+def get_circuit_breaker_status(calibration_error_value):
+    if np.isnan(calibration_error_value):
+        return "SIN_LECTURA"
+    if calibration_error_value >= CALIBRATION_ERROR_THRESHOLD:
+        return "MODELO_DESCALIBRADO"
+    return "CALIBRADO"
+
+
+def is_rankable_status(status):
+    return status == "CALIBRADO"
+
+
+def calculate_asymmetry_score(median_return, cvar_return):
+    denominator = abs(cvar_return)
+    if denominator <= 1e-12:
+        return np.nan
+    return float(median_return / denominator)
 
 
 def kalman_filter_mean(returns, process_variance=1e-6, observation_variance=None):
@@ -204,8 +244,15 @@ def simulate_dynamic_gbm(
         num_days,
         num_simulations,
     )
-    log_returns = get_log_returns(close_prices)
-    logger.info("%s | Log returns ready | observations=%s", ticker, len(log_returns))
+    calibration_prices = get_calibration_prices(close_prices)
+    log_returns = get_log_returns(calibration_prices)
+    logger.info(
+        "%s | Calibration window ready | start=%s | prices=%s | returns=%s",
+        ticker,
+        calibration_prices.index.min().date(),
+        len(calibration_prices),
+        len(log_returns),
+    )
 
     mu_series = kalman_filter_mean(log_returns)
     sigma_series = ewma_volatility(log_returns)
@@ -219,13 +266,21 @@ def simulate_dynamic_gbm(
         implied_sigma = get_atm_implied_volatility(ticker, current_price, num_days)
 
     sigma_used = float(np.nanmean([dynamic_sigma, implied_sigma])) if implied_sigma else dynamic_sigma
+    calibration_error_value = calibration_error(mu_series, sigma_series)
+    circuit_breaker_status = get_circuit_breaker_status(calibration_error_value)
+    rankable = is_rankable_status(circuit_breaker_status)
     logger.info(
-        "%s | Parameters | current=%.4f | mu=%.8f | sigma_ewma=%.6f | sigma_used=%.6f",
+        (
+            "%s | Parameters | current=%.4f | mu=%.8f | sigma_ewma=%.6f | "
+            "sigma_used=%.6f | calibration_error=%.4f | status=%s"
+        ),
         ticker,
         current_price,
         dynamic_mu,
         dynamic_sigma,
         sigma_used,
+        calibration_error_value,
+        circuit_breaker_status,
     )
 
     long_run_variance = float(sigma_series.tail(ROLLING_WINDOW).pow(2).mean())
@@ -253,30 +308,39 @@ def simulate_dynamic_gbm(
 
     final_prices = simulation_df[-1, :]
     median_final_price = float(np.median(final_prices))
+    median_return = float((median_final_price / current_price) - 1)
     representative_index = int(np.argmin(np.abs(final_prices - median_final_price)))
     representative_path = simulation_df[:, representative_index]
     final_returns = (final_prices / current_price) - 1
     var_5_return = float(np.percentile(final_returns, VAR_LEVEL * 100))
     cvar_5_return = float(final_returns[final_returns <= var_5_return].mean())
+    asymmetry_score = calculate_asymmetry_score(median_return, cvar_5_return)
     logger.info(
-        "%s | Simulation complete | median=%.4f | VaR5=%.2f%% | CVaR5=%.2f%%",
+        "%s | Simulation complete | median=%.4f | median_return=%.2f%% | CVaR5=%.2f%% | asymmetry=%.4f",
         ticker,
         median_final_price,
-        var_5_return * 100,
+        median_return * 100,
         cvar_5_return * 100,
+        asymmetry_score,
     )
 
     return SimulationResult(
         ticker=ticker,
         current_price=current_price,
+        calibration_start_date=str(calibration_prices.index.min().date()),
+        calibration_observations=len(log_returns),
         dynamic_mu=dynamic_mu,
         dynamic_sigma=dynamic_sigma,
         implied_sigma=implied_sigma,
         sigma_used=sigma_used,
-        calibration_error=calibration_error(mu_series, sigma_series),
+        calibration_error=calibration_error_value,
+        circuit_breaker_status=circuit_breaker_status,
+        rankable=rankable,
         simulation_df=simulation_df,
         final_prices=final_prices,
         median_final_price=median_final_price,
+        median_return=median_return,
+        asymmetry_score=asymmetry_score,
         representative_path=representative_path,
         var_5_return=var_5_return,
         cvar_5_return=cvar_5_return,
@@ -296,15 +360,24 @@ def summarize_results(results):
                 "Mediana simulada": result.median_final_price,
                 "Piso 95%": result.lower_bound,
                 "Techo 95%": result.upper_bound,
-                "Cambio % vs actual": ((result.median_final_price / result.current_price) - 1) * 100,
+                "Cambio % vs actual": result.median_return * 100,
                 "VaR 5%": result.var_5_return * 100,
                 "CVaR 5%": result.cvar_5_return * 100,
+                "Score asimetria": result.asymmetry_score,
                 "Sigma usada diaria": result.sigma_used,
                 "Error calibracion": result.calibration_error,
+                "Estado modelo": result.circuit_breaker_status,
+                "Rankeable": result.rankable,
+                "Inicio calibracion": result.calibration_start_date,
+                "Obs calibracion": result.calibration_observations,
             }
         )
 
-    return pd.DataFrame(rows).sort_values("Cambio % vs actual", ascending=False).reset_index(drop=True)
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["Rankeable", "Score asimetria"], ascending=[False, False], na_position="last")
+        .reset_index(drop=True)
+    )
 
 
 def format_percent(value):
@@ -315,14 +388,23 @@ def format_price(value):
     return f"{value:,.2f}"
 
 
+def format_model_status(status):
+    status_map = {
+        "CALIBRADO": "calibrado",
+        "MODELO_DESCALIBRADO": "recalibrar",
+        "SIN_LECTURA": "sin lectura",
+    }
+    return status_map.get(status, str(status).lower())
+
+
 def classify_calibration_error(value):
     if np.isnan(value):
         return "sin lectura"
     if value < 0.03:
         return "estable"
-    if value < 0.08:
+    if value < CALIBRATION_ERROR_THRESHOLD:
         return "vigilar"
-    return "inestable"
+    return "descalibrado"
 
 
 def classify_tail_risk(cvar_return):
@@ -334,34 +416,39 @@ def classify_tail_risk(cvar_return):
 
 
 def investor_diagnosis(row):
+    if row.get("Estado modelo") == "MODELO_DESCALIBRADO":
+        return "Modelo descalibrado: requiere ajuste de parametros."
+
     change = row["Cambio % vs actual"]
     cvar = row["CVaR 5%"]
-    calibration = row["Error calibracion"]
+    score = row["Score asimetria"]
 
-    if change > 0 and cvar > -8 and calibration < 0.08:
-        return "Escenario favorable, riesgo de cola manejable."
+    if change > 0 and cvar > -8 and score > 0:
+        return "Centro sobre spot y cola manejable."
     if change > 0 and cvar <= -8:
-        return "Potencial positivo, pero la caida mala pesa."
+        return "Centro positivo, pero la perdida mala pesa."
     if change <= 0 and cvar <= -8:
-        return "Escenario debil y cola de perdida exigente."
-    if calibration >= 0.08:
-        return "Modelo inestable: usar menor confianza."
-    return "Escenario mixto: revisar posicion y horizonte."
+        return "Centro bajo spot y cola exigente."
+    if change <= 0:
+        return "Centro bajo spot; no es precio objetivo."
+    return "Escenario mixto: revisar asimetria."
 
 
 def investor_diagnosis_short(row):
+    if row.get("Estado modelo") == "MODELO_DESCALIBRADO":
+        return "Recalibrar"
+
     change = row["Cambio % vs actual"]
     cvar = row["CVaR 5%"]
-    calibration = row["Error calibracion"]
 
-    if calibration >= 0.08:
-        return "Baja confianza"
     if change > 0 and cvar > -8:
-        return "Favorable"
+        return "Centro compensa"
     if change > 0 and cvar <= -8:
-        return "Potencial con cola"
+        return "Cola pesa"
     if change <= 0 and cvar <= -8:
-        return "Debil"
+        return "Centro bajo + cola"
+    if change <= 0:
+        return "Centro bajo"
     return "Mixto"
 
 
@@ -394,7 +481,7 @@ def add_report_header(fig, title, subtitle=None, section="Monte Carlo GBM"):
 
 def add_report_footer(fig, page_label):
     footer = (
-        f"{page_label} | Fuente: yfinance | Inicio data: {START_DATE} | "
+        f"{page_label} | Fuente: yfinance | Data: {DATA_START_DATE} | Calibracion: {CALIBRATION_START_DATE} | "
         f"{NUM_SIMULATIONS:,} simulaciones"
     )
     fig.add_artist(
@@ -492,7 +579,7 @@ def add_cover_page(pdf, summary_df):
         "Reporte ejecutivo",
     )
 
-    best_row = summary_df.iloc[0]
+    best_row = summary_df[summary_df["Rankeable"]].iloc[0] if summary_df["Rankeable"].any() else summary_df.iloc[0]
     worst_tail_row = summary_df.sort_values("CVaR 5%").iloc[0]
     most_unstable_row = summary_df.sort_values("Error calibracion", ascending=False).iloc[0]
 
@@ -501,10 +588,10 @@ def add_cover_page(pdf, summary_df):
         0.07,
         0.67,
         0.27,
-        "Mejor centro",
+        "Mejor asimetria",
         str(best_row["Ticker"]),
-        f"Mediana vs actual: {format_percent(best_row['Cambio % vs actual'])}",
-        REPORT_GREEN if best_row["Cambio % vs actual"] >= 0 else REPORT_RED,
+        f"Score: {best_row['Score asimetria']:.3f}",
+        REPORT_GREEN if best_row["Score asimetria"] >= 0 else REPORT_RED,
     )
     add_metric_card(
         fig,
@@ -521,10 +608,10 @@ def add_cover_page(pdf, summary_df):
         0.67,
         0.67,
         0.27,
-        "Modelo mas fragil",
+        "Revisar calibracion",
         str(most_unstable_row["Ticker"]),
-        f"Error: {most_unstable_row['Error calibracion']:.4f}",
-        REPORT_BLUE,
+        f"{format_model_status(most_unstable_row['Estado modelo'])} | Error: {most_unstable_row['Error calibracion']:.4f}",
+        REPORT_RED if most_unstable_row["Estado modelo"] == "MODELO_DESCALIBRADO" else REPORT_BLUE,
     )
 
     add_text_block(
@@ -534,8 +621,8 @@ def add_cover_page(pdf, summary_df):
         "Diagnostico del sistema",
         (
             "El motor no entrega una prediccion. Entrega una distribucion de escenarios. "
-            "Para invertir, la lectura practica es comparar si el centro compensa el riesgo "
-            "de cola y si el modelo esta estable."
+            "Para invertir, la lectura practica es evaluar si el centro compensa la perdida "
+            "mala y si el modelo esta calibrado."
         ),
         chars=62,
     )
@@ -545,9 +632,8 @@ def add_cover_page(pdf, summary_df):
         0.49,
         "Regla de lectura",
         (
-            "Una accion con mediana alta pero CVaR muy negativo puede tener potencial, "
-            "pero exige control de perdida. Si el error de calibracion sube, la confianza "
-            "en la hoja de ruta baja."
+            "Una accion descalibrada no entra al ranking principal. Una mediana debajo del "
+            "spot no significa empresa debil; significa centro simulado bajo el precio actual."
         ),
         chars=52,
     )
@@ -571,8 +657,8 @@ def add_methodology_page(pdf):
         ("Centro", "La mediana muestra el punto medio de las simulaciones. No es precio objetivo."),
         ("Rango", "Piso 95% y techo 95% muestran donde cae la mayor parte de escenarios."),
         ("Perdida mala", "VaR y CVaR resumen que pasa en el peor 5% de escenarios."),
-        ("Regimen", "Kalman y EWMA dan mas peso a la informacion reciente."),
-        ("Fragilidad", "Error de calibracion alto significa que media o volatilidad estan cambiando rapido."),
+        ("Asimetria", "El score compara centro simulado contra perdida mala. Es mejor que mirar solo direccion."),
+        ("Disyuntor", "Si el modelo esta descalibrado, no se rankea hasta ajustar parametros."),
     ]
 
     y_position = 0.74
@@ -589,7 +675,7 @@ def add_methodology_page(pdf):
         "Decision practica",
         (
             "Comprar, mantener o descartar no sale de una sola metrica. La decision razonable "
-            "cruza centro esperado, perdida mala y estabilidad del modelo."
+            "cruza centro, perdida mala, asimetria y estado del modelo."
         ),
         chars=47,
     )
@@ -599,8 +685,8 @@ def add_methodology_page(pdf):
         0.55,
         "Uso correcto",
         (
-            "El informe sirve para priorizar revision. No reemplaza tesis fundamental, sizing, "
-            "liquidez, costos ni validacion fuera de muestra."
+            "El informe prioriza revision. No reemplaza tesis fundamental, sizing, liquidez, "
+            "costos ni validacion fuera de muestra."
         ),
         chars=47,
     )
@@ -612,7 +698,7 @@ def add_methodology_page(pdf):
 def add_summary_table_page(pdf, summary_df):
     display_df = summary_df.copy()
     display_df["Cola"] = display_df["CVaR 5%"].apply(lambda value: classify_tail_risk(value / 100))
-    display_df["Estabilidad"] = display_df["Error calibracion"].apply(classify_calibration_error)
+    display_df["Estado"] = display_df["Estado modelo"].apply(format_model_status)
     display_df["Lectura"] = display_df.apply(investor_diagnosis_short, axis=1)
     display_df = display_df[
         [
@@ -621,7 +707,8 @@ def add_summary_table_page(pdf, summary_df):
             "Mediana simulada",
             "Cambio % vs actual",
             "CVaR 5%",
-            "Estabilidad",
+            "Score asimetria",
+            "Estado",
             "Cola",
             "Lectura",
         ]
@@ -630,6 +717,7 @@ def add_summary_table_page(pdf, summary_df):
     display_df["Mediana simulada"] = display_df["Mediana simulada"].map(format_price)
     display_df["Cambio % vs actual"] = display_df["Cambio % vs actual"].map(format_percent)
     display_df["CVaR 5%"] = display_df["CVaR 5%"].map(format_percent)
+    display_df["Score asimetria"] = display_df["Score asimetria"].map(lambda value: f"{value:.3f}")
 
     fig = make_report_figure()
     add_report_header(
@@ -649,8 +737,8 @@ def add_summary_table_page(pdf, summary_df):
         bbox=[0, 0.26, 1, 0.52],
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(7.0)
-    column_widths = [0.07, 0.11, 0.13, 0.12, 0.10, 0.12, 0.13, 0.22]
+    table.set_fontsize(6.8)
+    column_widths = [0.07, 0.10, 0.12, 0.12, 0.10, 0.11, 0.11, 0.13, 0.24]
 
     for (row, column), cell in table.get_celld().items():
         cell.set_edgecolor(REPORT_BORDER)
@@ -662,9 +750,12 @@ def add_summary_table_page(pdf, summary_df):
             cell.set_text_props(color="white", weight="bold")
         else:
             cell.set_facecolor(REPORT_LIGHT_GRAY if row % 2 == 0 else "white")
-            if column in (3, 4):
-                raw_value = summary_df.iloc[row - 1, summary_df.columns.get_loc("Cambio % vs actual" if column == 3 else "CVaR 5%")]
+            if column in (3, 4, 5):
+                column_name = {3: "Cambio % vs actual", 4: "CVaR 5%", 5: "Score asimetria"}[column]
+                raw_value = summary_df.iloc[row - 1, summary_df.columns.get_loc(column_name)]
                 cell.set_text_props(color=REPORT_GREEN if raw_value >= 0 else REPORT_RED)
+            if column == 6 and summary_df.iloc[row - 1]["Estado modelo"] == "MODELO_DESCALIBRADO":
+                cell.set_text_props(color=REPORT_RED, weight="bold")
 
     add_report_footer(fig, "Resumen")
     pdf.savefig(fig)
@@ -675,31 +766,38 @@ def add_risk_return_page(pdf, summary_df):
     fig = make_report_figure()
     add_report_header(
         fig,
-        "Decision bajo incertidumbre",
-        "El centro se compara contra la perdida promedio en escenarios malos.",
+        "Asimetria del escenario",
+        "El score compara centro simulado contra perdida mala. Modelos descalibrados no rankean.",
         "Diagnostico",
     )
-    axes = [
-        fig.add_axes([0.08, 0.18, 0.38, 0.62]),
-        fig.add_axes([0.56, 0.18, 0.38, 0.62]),
+    ax = fig.add_axes([0.10, 0.20, 0.78, 0.58])
+    sorted_score = summary_df.sort_values("Score asimetria")
+    colors = [
+        REPORT_GRAY
+        if not rankable
+        else REPORT_GREEN
+        if score >= 0
+        else REPORT_RED
+        for score, rankable in zip(sorted_score["Score asimetria"], sorted_score["Rankeable"])
     ]
-    sorted_return = summary_df.sort_values("Cambio % vs actual")
-    sorted_tail = summary_df.sort_values("CVaR 5%")
+    ax.barh(sorted_score["Ticker"], sorted_score["Score asimetria"], color=colors)
+    ax.axvline(0, color=REPORT_NAVY, linewidth=0.8)
+    ax.set_title("Score de asimetria = retorno mediano / abs(CVaR 5%)", loc="left", fontsize=11, fontweight="bold", color=REPORT_NAVY)
+    ax.set_xlabel("Score")
+    ax.grid(axis="x", alpha=0.18)
+    ax.spines[["top", "right"]].set_visible(False)
 
-    return_colors = [REPORT_GREEN if value >= 0 else REPORT_RED for value in sorted_return["Cambio % vs actual"]]
-    axes[0].barh(sorted_return["Ticker"], sorted_return["Cambio % vs actual"], color=return_colors)
-    axes[0].axvline(0, color=REPORT_NAVY, linewidth=0.8)
-    axes[0].set_title("Centro vs precio actual", loc="left", fontsize=11, fontweight="bold", color=REPORT_NAVY)
-    axes[0].set_xlabel("%")
-    axes[0].grid(axis="x", alpha=0.18)
-    axes[0].spines[["top", "right"]].set_visible(False)
-
-    axes[1].barh(sorted_tail["Ticker"], sorted_tail["CVaR 5%"], color=REPORT_RED)
-    axes[1].axvline(0, color=REPORT_NAVY, linewidth=0.8)
-    axes[1].set_title("Perdida promedio en peor 5%", loc="left", fontsize=11, fontweight="bold", color=REPORT_NAVY)
-    axes[1].set_xlabel("%")
-    axes[1].grid(axis="x", alpha=0.18)
-    axes[1].spines[["top", "right"]].set_visible(False)
+    add_text_block(
+        fig,
+        0.10,
+        0.115,
+        "Lectura",
+        (
+            "Score positivo: el centro simulado queda sobre el spot. Score negativo: el centro queda debajo. "
+            "Barra gris: el modelo esta descalibrado y no debe usarse para ranking."
+        ),
+        chars=125,
+    )
 
     add_report_footer(fig, "Diagnostico")
     pdf.savefig(fig)
@@ -708,7 +806,8 @@ def add_risk_return_page(pdf, summary_df):
 
 def add_ticker_page(pdf, result):
     fig = make_report_figure()
-    change = ((result.median_final_price / result.current_price) - 1) * 100
+    change = result.median_return * 100
+    status_accent = REPORT_GRAY if not result.rankable else REPORT_BLUE
     add_report_header(
         fig,
         f"Ficha de accion: {result.ticker}",
@@ -732,21 +831,31 @@ def add_ticker_page(pdf, result):
         0.51,
         0.73,
         0.20,
-        "CVaR 5%",
-        format_percent(result.cvar_5_return * 100),
-        classify_tail_risk(result.cvar_5_return),
-        REPORT_RED,
+        "Asimetria",
+        f"{result.asymmetry_score:.3f}",
+        "mediana / abs(CVaR)",
+        REPORT_GREEN if result.asymmetry_score >= 0 and result.rankable else REPORT_RED if result.rankable else REPORT_GRAY,
     )
     add_metric_card(
         fig,
         0.73,
         0.73,
         0.20,
-        "Estabilidad",
-        classify_calibration_error(result.calibration_error),
+        "Estado modelo",
+        format_model_status(result.circuit_breaker_status),
         f"Error: {result.calibration_error:.4f}",
-        REPORT_BLUE,
+        status_accent,
     )
+
+    if not result.rankable:
+        fig.text(
+            0.07,
+            0.685,
+            "Circuit breaker activo: modelo descalibrado. No usar esta ficha como ranking hasta recalibrar parametros.",
+            fontsize=8.5,
+            color=REPORT_RED,
+            weight="bold",
+        )
 
     axes = [
         fig.add_axes([0.07, 0.40, 0.86, 0.25]),
@@ -787,11 +896,16 @@ def run_single_ticker(ticker=SINGLE_TICKER):
     result = simulate_dynamic_gbm(close_prices, ticker, NUM_DAYS_SINGLE_TICKER, NUM_SIMULATIONS)
 
     print(f"--- Resultado {ticker} ---")
+    print(f"Inicio calibracion: {result.calibration_start_date}")
+    print(f"Observaciones calibracion: {result.calibration_observations}")
     print(f"Precio actual: {result.current_price:.2f}")
     print(f"Mediana simulada: {result.median_final_price:.2f}")
+    print(f"Cambio mediano vs actual: {result.median_return * 100:.2f}%")
     print(f"VaR 5%: {result.var_5_return * 100:.2f}%")
     print(f"CVaR 5%: {result.cvar_5_return * 100:.2f}%")
+    print(f"Score asimetria: {result.asymmetry_score:.4f}")
     print(f"Error calibracion: {result.calibration_error:.4f}")
+    print(f"Estado modelo: {result.circuit_breaker_status}")
 
 
 def run_multiple_tickers(tickers=None, output_path=REPORT_PATH):

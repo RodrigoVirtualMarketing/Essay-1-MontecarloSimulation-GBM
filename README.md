@@ -16,6 +16,26 @@ El proposito real de modelar no es fabricar certeza. Es proporcionar un marco in
 
 En esta version, el proyecto mantiene la base GBM, pero refuerza el analisis con herramientas mas robustas: media dinamica, volatilidad reciente, volatilidad implicita cuando esta disponible, colas pesadas, persistencia de volatilidad, `VaR`, `CVaR` y error de calibracion.
 
+## Revision 1: Direccion Del Proyecto
+
+`draft-1` cierra la primera version: motor Monte Carlo para acciones, reporte PDF y lectura de riesgo.
+
+`revision-1` abre la siguiente fase: convertir el proyecto en una arquitectura de decision bajo incertidumbre. El foco ya no es solo simular precios, sino evaluar decisiones con valor esperado positivo, control de drawdown y estado de calibracion del modelo.
+
+La nueva fase se apoya en dos documentos:
+
+- [Arquitectura de conocimiento cuantitativo](docs/revision-1-quant-architecture.md): marco conceptual de probabilidad, validacion, no-estacionariedad y portafolio.
+- [Marco matematico acciones/UFC](docs/revision-1-math-framework.md): formato comun para acciones, UFC, EV, Kelly fraccional, circuit breaker y ranking ajustado por riesgo.
+
+Principio rector:
+
+```text
+no se busca predecir
+se busca decidir con incertidumbre, edge positivo y riesgo sobrevivible
+```
+
+La integracion futura con UFC usara un proyecto externo de Google Colab con modelos de IA. Este repositorio no reescribira ese motor al inicio; primero definira una interfaz para recibir probabilidades, calcular EV, comparar contra cuotas y controlar sizing.
+
 ## Marco Teorico
 
 Bajo esta optica, las generalizaciones dejan de ser etiquetas y pasan a ser estimaciones de comportamiento agregado. No pretendemos describir la accion individual final. Buscamos estimar la respuesta del sistema usando patrones observados en la serie historica.
@@ -30,12 +50,12 @@ El proyecto trata el precio como una serie de tiempo. Cada cierre diario aliment
 
 El algoritmo tiene seis responsabilidades:
 
-1. Descargar y limpiar precios historicos con `yfinance`.
+1. Descargar y limpiar precios historicos recientes con `yfinance`.
 2. Separar la serie de cierre ajustado por accion.
-3. Estimar media dinamica con filtro de Kalman.
+3. Filtrar una ventana de calibracion compatible con el regimen actual.
 4. Estimar volatilidad dinamica con EWMA y, cuando sea posible, complementar con volatilidad implicita de opciones.
 5. Ejecutar simulaciones Monte Carlo con GBM, choques `t-Student` y persistencia de volatilidad.
-6. Procesar resultados en terminos de mediana, rango 95%, `VaR 5%`, `CVaR 5%` y error de calibracion.
+6. Procesar resultados en terminos de mediana, rango 95%, `VaR 5%`, `CVaR 5%`, score de asimetria y estado de calibracion.
 
 La implementacion usa `pandas` para datos, `numpy` para computo numerico, `scipy` para la distribucion `t-Student`, `yfinance` para precios/opciones y `matplotlib`/`seaborn` para el informe visual.
 
@@ -48,8 +68,9 @@ El output principal es un PDF minimalista con metricas de valor:
 - Centro: `Mediana simulada`.
 - Rango: `Piso 95%` y `Techo 95%`.
 - Riesgo de cola: `VaR 5%` y `CVaR 5%`.
-- Estabilidad: `Error calibracion`.
-- Comparacion: ranking entre acciones bajo la misma regla.
+- Asimetria: `Score asimetria`.
+- Estado del modelo: `CALIBRADO` o `MODELO_DESCALIBRADO`.
+- Comparacion: ranking solo entre acciones rankeables bajo la misma regla.
 
 ## Flujo De Datos
 
@@ -112,16 +133,19 @@ Ahora usa:
 
 | Variable | Que controla | Uso practico |
 | --- | --- | --- |
-| `START_DATE` | Fecha inicial de descarga | Define cuanta historia entra al modelo |
+| `DATA_START_DATE` | Fecha inicial de descarga | Define desde cuando se baja data de mercado |
+| `CALIBRATION_START_DATE` | Fecha minima de calibracion | Evita usar regimenes demasiado antiguos |
 | `TICKERS` | Lista de acciones | Define el universo comparado |
 | `SINGLE_TICKER` | Accion individual | Sirve para pruebas de una sola accion |
 | `NUM_SIMULATIONS` | Cantidad de caminos simulados | Mas simulaciones reducen ruido estadistico |
 | `NUM_DAYS_SINGLE_TICKER` | Horizonte individual | Dias simulados para una accion |
 | `NUM_DAYS_MULTIPLE_TICKERS` | Horizonte comparativo | Dias simulados para varias acciones |
+| `LOOKBACK_DAYS` | Ventana efectiva de calibracion | Limita cuantos dias recientes alimentan parametros |
 | `ROLLING_WINDOW` | Ventana reciente | Base para varianza de largo plazo |
 | `EWMA_LAMBDA` | Peso de volatilidad reciente | Controla sensibilidad a cambios de regimen |
 | `STUDENT_T_DF` | Grados de libertad t-Student | Menor valor implica colas mas pesadas |
 | `VAR_LEVEL` | Nivel de cola | Define el percentil usado para VaR y CVaR |
+| `CALIBRATION_ERROR_THRESHOLD` | Umbral de descalibracion | Activa el circuit breaker del modelo |
 | `REPORT_PATH` | Ruta del PDF | Define donde se guarda el informe |
 
 ## Metricas Del Reporte
@@ -135,8 +159,10 @@ Ahora usa:
 | `Cambio % vs actual` | Diferencia entre mediana simulada y precio actual |
 | `VaR 5%` | Perdida minima al entrar en el peor 5% de escenarios |
 | `CVaR 5%` | Perdida promedio dentro del peor 5% |
+| `Score asimetria` | Mediana de retorno dividida entre perdida mala absoluta |
 | `Sigma usada diaria` | Volatilidad diaria usada por el motor |
 | `Error calibracion` | Alerta de inestabilidad reciente en media y volatilidad |
+| `Estado modelo` | Define si el activo entra al ranking o requiere recalibracion |
 
 ## Como Ejecutar
 
@@ -165,14 +191,15 @@ El progreso se muestra con logger:
 
 Una accion con mediana positiva pero `CVaR 5%` muy negativo puede tener upside, pero tambien cola de perdida fuerte.
 
-Una accion con `Error calibracion` alto esta en una zona menos estable: la media o la volatilidad reciente estan cambiando rapido.
+Una accion con `Error calibracion` alto queda marcada como `MODELO_DESCALIBRADO`: no debe rankearse como si sus metricas tuvieran el mismo peso que las demas.
 
 El diagnostico del sistema debe leerse asi:
 
 - `Centro`: donde cae la mediana de los escenarios simulados.
 - `Rango`: cuanto se abre la distribucion de precios posibles.
 - `Perdida mala`: cuanto podria doler el peor 5% de escenarios.
-- `Estabilidad`: que tanta confianza merece la calibracion reciente.
+- `Asimetria`: si el centro compensa la perdida mala.
+- `Estado modelo`: si la distribucion puede entrar al ranking o requiere recalibracion.
 
 El informe sirve para comparar escenarios bajo incertidumbre. No reemplaza decision de inversion, control de riesgo ni validacion fuera de muestra.
 
