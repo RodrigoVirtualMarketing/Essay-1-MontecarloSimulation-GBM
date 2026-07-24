@@ -16,6 +16,20 @@ import yfinance as yf
 from matplotlib.backends.backend_pdf import PdfPages
 from scipy.stats import t
 
+from option_analysis import (
+    DEFAULT_OPTION_RISK_FREE_RATE,
+    OptionOverlayResult,
+    annualize_daily_volatility,
+    build_option_overlay,
+)
+from portfolio_analysis import (
+    DEFAULT_PORTFOLIO_BENCHMARK,
+    DEFAULT_PORTFOLIO_ROLLING_WINDOW,
+    DEFAULT_PORTFOLIO_SECTOR_MAP,
+    PortfolioAnalyticsResult,
+    build_portfolio_analytics,
+)
+
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -27,10 +41,10 @@ DATA_START_DATE = "2010-01-01"
 CALIBRATION_START_DATE = "2020-01-01"
 START_DATE = DATA_START_DATE
 SINGLE_TICKER = "AAPL"
-TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "PLTR"]
+TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "PLTR", "SNDK","T.TO", "NVDA","SLBT"]
 NUM_SIMULATIONS = 10_000
 NUM_DAYS_SINGLE_TICKER = 252
-NUM_DAYS_MULTIPLE_TICKERS = 22
+NUM_DAYS_MULTIPLE_TICKERS = 252
 LOOKBACK_DAYS = 756
 ROLLING_WINDOW = 252
 EWMA_LAMBDA = 0.94
@@ -53,6 +67,10 @@ REPORT_LIGHT_GRAY = "#F2F4F7"
 REPORT_BORDER = "#D8DEE6"
 REPORT_TEXT = "#20242A"
 MAX_PATHS_TO_PLOT = 450
+PORTFOLIO_SECTOR_MAP = DEFAULT_PORTFOLIO_SECTOR_MAP
+PORTFOLIO_BENCHMARK_TICKER = DEFAULT_PORTFOLIO_BENCHMARK
+PORTFOLIO_ROLLING_WINDOW = DEFAULT_PORTFOLIO_ROLLING_WINDOW
+OPTION_RISK_FREE_RATE = DEFAULT_OPTION_RISK_FREE_RATE
 
 
 def setup_logging(level=logging.INFO):
@@ -88,6 +106,7 @@ class SimulationResult:
     cvar_5_return: float
     lower_bound: float
     upper_bound: float
+    option_overlay: Optional[OptionOverlayResult]
 
 
 def warning_cleaner(message, category, filename, lineno, file=None, line=None):
@@ -177,40 +196,6 @@ def ewma_volatility(returns, lambda_=EWMA_LAMBDA):
     return np.sqrt(variance)
 
 
-def get_atm_implied_volatility(ticker, current_price, target_days):
-    """Optional forward-looking sigma from the nearest ATM option expiry."""
-    try:
-        logger.info("%s | Fetching option chain for implied volatility", ticker)
-        yf_ticker = yf.Ticker(ticker)
-        expirations = yf_ticker.options
-        if not expirations:
-            logger.warning("%s | No option expirations available", ticker)
-            return None
-
-        today = pd.Timestamp.today(tz=None).normalize()
-        expiration_dates = pd.to_datetime(expirations)
-        target_date = today + pd.Timedelta(days=target_days)
-        expiration = expirations[np.argmin(np.abs((expiration_dates - target_date).days))]
-        logger.info("%s | Selected option expiration=%s", ticker, expiration)
-        chain = yf_ticker.option_chain(expiration)
-        option_rows = pd.concat([chain.calls, chain.puts], ignore_index=True)
-        option_rows = option_rows.dropna(subset=["strike", "impliedVolatility"])
-
-        if option_rows.empty:
-            logger.warning("%s | Option chain has no usable implied volatility rows", ticker)
-            return None
-
-        option_rows["distance_to_spot"] = (option_rows["strike"] - current_price).abs()
-        atm_rows = option_rows.nsmallest(4, "distance_to_spot")
-        implied_volatility = atm_rows["impliedVolatility"].median()
-        daily_implied_volatility = float(implied_volatility / np.sqrt(252))
-        logger.info("%s | Daily implied volatility=%.6f", ticker, daily_implied_volatility)
-        return daily_implied_volatility
-    except Exception as exc:
-        logger.warning("%s | Implied volatility unavailable: %s", ticker, exc)
-        return None
-
-
 def calibration_error(mu_series, sigma_series, lookback=20):
     recent_mu = mu_series.dropna().tail(lookback)
     recent_sigma = sigma_series.dropna().tail(lookback)
@@ -261,9 +246,33 @@ def simulate_dynamic_gbm(
     dynamic_sigma = float(sigma_series.iloc[-1])
     current_price = float(close_prices.iloc[-1])
     implied_sigma = None
+    option_overlay = None
 
     if use_implied_volatility:
-        implied_sigma = get_atm_implied_volatility(ticker, current_price, num_days)
+        try:
+            option_overlay = build_option_overlay(
+                ticker=ticker,
+                current_price=current_price,
+                target_days=num_days,
+                model_sigma_annualized=annualize_daily_volatility(dynamic_sigma),
+                risk_free_rate=OPTION_RISK_FREE_RATE,
+            )
+            implied_sigma = option_overlay.snapshot.daily_implied_volatility
+            logger.info(
+                (
+                    "%s | Option overlay | expiry=%s | strike=%.2f | market=%.4f | "
+                    "model=%.4f | ratio=%.4f | signal=%s"
+                ),
+                ticker,
+                option_overlay.snapshot.expiration,
+                option_overlay.snapshot.strike,
+                option_overlay.snapshot.market_price,
+                option_overlay.model_quote.price,
+                option_overlay.market_to_model_ratio,
+                option_overlay.signal.action,
+            )
+        except Exception as exc:
+            logger.warning("%s | Option overlay unavailable: %s", ticker, exc)
 
     sigma_used = float(np.nanmean([dynamic_sigma, implied_sigma])) if implied_sigma else dynamic_sigma
     calibration_error_value = calibration_error(mu_series, sigma_series)
@@ -315,14 +324,7 @@ def simulate_dynamic_gbm(
     var_5_return = float(np.percentile(final_returns, VAR_LEVEL * 100))
     cvar_5_return = float(final_returns[final_returns <= var_5_return].mean())
     asymmetry_score = calculate_asymmetry_score(median_return, cvar_5_return)
-    logger.info(
-        "%s | Simulation complete | median=%.4f | median_return=%.2f%% | CVaR5=%.2f%% | asymmetry=%.4f",
-        ticker,
-        median_final_price,
-        median_return * 100,
-        cvar_5_return * 100,
-        asymmetry_score,
-    )
+    logger.info("%s | Simulation complete | median=%.4f | median_return=%.2f%% | CVaR5=%.2f%% | asymmetry=%.4f", ticker, median_final_price, median_return * 100, cvar_5_return * 100, asymmetry_score)
 
     return SimulationResult(
         ticker=ticker,
@@ -346,6 +348,7 @@ def simulate_dynamic_gbm(
         cvar_5_return=cvar_5_return,
         lower_bound=float(np.percentile(final_prices, 2.5)),
         upper_bound=float(np.percentile(final_prices, 97.5)),
+        option_overlay=option_overlay,
     )
 
 
@@ -353,6 +356,7 @@ def summarize_results(results):
     logger.info("Building consolidated summary | tickers=%s", len(results))
     rows = []
     for result in results:
+        option_overlay = result.option_overlay
         rows.append(
             {
                 "Ticker": result.ticker,
@@ -370,6 +374,12 @@ def summarize_results(results):
                 "Rankeable": result.rankable,
                 "Inicio calibracion": result.calibration_start_date,
                 "Obs calibracion": result.calibration_observations,
+                "Exp ATM": option_overlay.snapshot.expiration if option_overlay else "",
+                "Strike ATM": option_overlay.snapshot.strike if option_overlay else np.nan,
+                "Opcion mercado": option_overlay.snapshot.market_price if option_overlay else np.nan,
+                "Opcion modelo": option_overlay.model_quote.price if option_overlay else np.nan,
+                "Ratio opcion M/T": option_overlay.market_to_model_ratio if option_overlay else np.nan,
+                "Senal opcion ATM": option_overlay.signal.action if option_overlay else "SIN_OPCION",
             }
         )
 
@@ -522,9 +532,9 @@ def add_metric_card(fig, x, y, width, title, value, note="", accent=REPORT_BLUE)
         fig.text(x + 0.018, y + 0.022, note, fontsize=7.8, color=REPORT_GRAY)
 
 
-def add_text_block(fig, x, y, title, body, chars=52):
+def add_text_block(fig, x, y, title, body, chars=52, fontsize=8.8, color=REPORT_TEXT, line_height=0.023):
     fig.text(x, y, title, fontsize=10.5, color=REPORT_NAVY, weight="bold")
-    add_wrapped_text(fig, x, y - 0.035, body, chars=chars, fontsize=8.8, color=REPORT_TEXT, line_height=0.023)
+    add_wrapped_text(fig, x, y - 0.035, body, chars=chars, fontsize=fontsize, color=color, line_height=line_height)
 
 
 def add_paths_plot(ax, result):
@@ -574,15 +584,14 @@ def add_cover_page(pdf, summary_df):
     fig = make_report_figure()
     add_report_header(
         fig,
-        "Informe quant de escenarios y riesgo",
-        "Lectura para inversionista: centro probable, rango, perdida mala y estabilidad del modelo.",
+        "Informe quant de decision bajo incertidumbre",
+        "Lectura ejecutiva: EV, asimetria, perdida mala y estado de calibracion.",
         "Reporte ejecutivo",
     )
 
     best_row = summary_df[summary_df["Rankeable"]].iloc[0] if summary_df["Rankeable"].any() else summary_df.iloc[0]
     worst_tail_row = summary_df.sort_values("CVaR 5%").iloc[0]
     most_unstable_row = summary_df.sort_values("Error calibracion", ascending=False).iloc[0]
-
     add_metric_card(
         fig,
         0.07,
@@ -613,33 +622,88 @@ def add_cover_page(pdf, summary_df):
         f"{format_model_status(most_unstable_row['Estado modelo'])} | Error: {most_unstable_row['Error calibracion']:.4f}",
         REPORT_RED if most_unstable_row["Estado modelo"] == "MODELO_DESCALIBRADO" else REPORT_BLUE,
     )
+    add_metric_card(
+        fig,
+        0.67,
+        0.50,
+        0.27,
+        "Horizonte",
+        f"{NUM_DAYS_MULTIPLE_TICKERS} dias",
+        f"Calibracion: {LOOKBACK_DAYS} obs max",
+        REPORT_BLUE,
+    )
 
     add_text_block(
         fig,
         0.07,
-        0.49,
+        0.32,
         "Diagnostico del sistema",
         (
-            "El motor no entrega una prediccion. Entrega una distribucion de escenarios. "
-            "Para invertir, la lectura practica es evaluar si el centro compensa la perdida "
-            "mala y si el modelo esta calibrado."
+            "El motor no entrega una prediccion. Entrega una politica de lectura: usar solo "
+            "activos calibrados, exigir EV positivo y verificar que la cola no destruya la asimetria."
         ),
         chars=62,
     )
     add_text_block(
         fig,
         0.55,
-        0.49,
+        0.32,
         "Regla de lectura",
         (
-            "Una accion descalibrada no entra al ranking principal. Una mediana debajo del "
-            "spot no significa empresa debil; significa centro simulado bajo el precio actual."
+            "Una accion descalibrada no entra al ranking principal. EV positivo no equivale a compra: "
+            "solo habilita revision con sizing, liquidez, tesis y validacion fuera de muestra."
         ),
         chars=52,
     )
-    fig.text(0.07, 0.26, "Universo analizado", fontsize=10.5, color=REPORT_NAVY, weight="bold")
-    fig.text(0.07, 0.22, ", ".join(summary_df["Ticker"].astype(str)), fontsize=18, color=REPORT_TEXT, weight="bold")
+    fig.text(0.07, 0.15, "Universo analizado", fontsize=10.5, color=REPORT_NAVY, weight="bold")
+    fig.text(0.07, 0.11, ", ".join(summary_df["Ticker"].astype(str)), fontsize=18, color=REPORT_TEXT, weight="bold")
     add_report_footer(fig, "Portada")
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def add_policy_page(pdf):
+    fig = make_report_figure()
+    add_report_header(
+        fig,
+        "Politica de decision del reporte",
+        "El output no es una prediccion; es un filtro de decision bajo incertidumbre.",
+        "Gobierno del modelo",
+    )
+
+    steps = [
+        ("01", "Sistema incierto", "Mercado y UFC no tienen probabilidades fijas. El modelo estima con informacion actual."),
+        ("02", "EV primero", "La decision solo puede avanzar si el valor esperado es positivo."),
+        ("03", "Riesgo despues", "CVaR y drawdown mandan sobre una mediana atractiva."),
+        ("04", "Disyuntor", "Si el modelo esta descalibrado, se muestra pero no se rankea."),
+        ("05", "Sizing", "La siguiente capa debe traducir EV y riesgo a exposicion, no a certeza."),
+    ]
+
+    y_position = 0.74
+    for number, title, body in steps:
+        fig.text(0.08, y_position, number, fontsize=13, color=REPORT_BLUE, weight="bold")
+        fig.text(0.15, y_position, title, fontsize=11, color=REPORT_NAVY, weight="bold")
+        add_wrapped_text(fig, 0.15, y_position - 0.035, body, chars=72, fontsize=9.1, color=REPORT_TEXT)
+        y_position -= 0.12
+
+    add_text_block(
+        fig,
+        0.58,
+        0.74,
+        "Formula base",
+        "EV = (P_model * Pago) - ((1 - P_model) * Perdida). En acciones, P_model sale de Monte Carlo. En UFC, saldra del modelo IA.",
+        chars=48,
+    )
+    add_text_block(
+        fig,
+        0.58,
+        0.51,
+        "Lectura final",
+        "RANKEABLE no significa comprar. Significa que el activo paso el filtro cuantitativo inicial y merece revision de posicion.",
+        chars=48,
+    )
+
+    add_report_footer(fig, "Politica")
     pdf.savefig(fig)
     plt.close(fig)
 
@@ -753,7 +817,6 @@ def add_summary_table_page(pdf, summary_df):
             if column in (3, 4, 5):
                 column_name = {3: "Cambio % vs actual", 4: "CVaR 5%", 5: "Score asimetria"}[column]
                 raw_value = summary_df.iloc[row - 1, summary_df.columns.get_loc(column_name)]
-                cell.set_text_props(color=REPORT_GREEN if raw_value >= 0 else REPORT_RED)
             if column == 6 and summary_df.iloc[row - 1]["Estado modelo"] == "MODELO_DESCALIBRADO":
                 cell.set_text_props(color=REPORT_RED, weight="bold")
 
@@ -804,9 +867,398 @@ def add_risk_return_page(pdf, summary_df):
     plt.close(fig)
 
 
+def add_option_overlay_page(pdf, summary_df):
+    option_df = summary_df[summary_df["Senal opcion ATM"] != "SIN_OPCION"].copy()
+    if option_df.empty:
+        return
+
+    display_df = option_df[
+        [
+            "Ticker",
+            "Exp ATM",
+            "Strike ATM",
+            "Opcion mercado",
+            "Opcion modelo",
+            "Ratio opcion M/T",
+            "Senal opcion ATM",
+        ]
+    ]
+    display_df["Strike ATM"] = display_df["Strike ATM"].map(format_price)
+    display_df["Opcion mercado"] = display_df["Opcion mercado"].map(format_price)
+    display_df["Opcion modelo"] = display_df["Opcion modelo"].map(format_price)
+    display_df["Ratio opcion M/T"] = display_df["Ratio opcion M/T"].map(lambda value: f"{value:.2f}x")
+
+    fig = make_report_figure()
+    add_report_header(
+        fig,
+        "Overlay ATM de opciones",
+        "Integracion de tech-engine: precio de mercado vs Black-Scholes usando sigma del modelo.",
+        "Derivados",
+    )
+    ax = fig.add_axes([0.07, 0.24, 0.86, 0.52])
+    ax.axis("off")
+    table = ax.table(
+        cellText=display_df.values,
+        colLabels=display_df.columns,
+        loc="upper center",
+        cellLoc="center",
+        colLoc="center",
+        bbox=[0, 0.05, 1, 0.82],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(7.1)
+
+    for (row, column), cell in table.get_celld().items():
+        cell.set_edgecolor(REPORT_BORDER)
+        cell.set_linewidth(0.55)
+        if row == 0:
+            cell.set_facecolor(REPORT_NAVY)
+            cell.set_text_props(color="white", weight="bold")
+            continue
+
+        cell.set_facecolor(REPORT_LIGHT_GRAY if row % 2 == 0 else "white")
+        signal_value = option_df.iloc[row - 1]["Senal opcion ATM"]
+        if column == 6 and signal_value == "BUY":
+            cell.set_text_props(color=REPORT_GREEN, weight="bold")
+        elif column == 6 and signal_value == "SELL":
+            cell.set_text_props(color=REPORT_RED, weight="bold")
+
+    add_text_block(
+        fig,
+        0.07,
+        0.15,
+        "Lectura",
+        (
+            "La senal ATM no reemplaza el motor GBM. Solo compara cuanto paga hoy el mercado "
+            "de opciones frente a una prima teorica construida con la volatilidad del modelo."
+        ),
+        chars=120,
+    )
+    add_report_footer(fig, "Overlay opciones")
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def add_portfolio_overview_page(pdf, portfolio_result: PortfolioAnalyticsResult):
+    fig = make_report_figure()
+    add_report_header(
+        fig,
+        "Cartera cuantitativa: diversificacion y exposicion al mercado",
+        "La cartera sectorial resume el equilibrio entre riesgo idiosincratico, riesgo de industria y riesgo sistematico.",
+        "Portfolio management",
+    )
+
+    sector_summary = portfolio_result.sector_summary.copy()
+    if sector_summary.empty:
+        raise ValueError("Portfolio sector summary is empty.")
+
+    best_sharpe_row = sector_summary.loc[sector_summary["Sharpe"].idxmax()]
+    lowest_beta_row = sector_summary.loc[sector_summary["Beta vs benchmark"].idxmin()]
+    worst_drawdown_row = sector_summary.loc[sector_summary["Max drawdown %"].idxmin()]
+    portfolio_total_return = float((portfolio_result.portfolio_wealth.iloc[-1] / portfolio_result.portfolio_wealth.iloc[0] - 1) * 100)
+    benchmark_total_return = float((portfolio_result.normalized_frame[portfolio_result.benchmark_ticker].iloc[-1] / portfolio_result.normalized_frame[portfolio_result.benchmark_ticker].iloc[0] - 1) * 100)
+
+    add_metric_card(
+        fig,
+        0.07,
+        0.73,
+        0.20,
+        "Cartera igual peso",
+        format_percent(portfolio_total_return),
+        "Promedio de sectores",
+        REPORT_GREEN if portfolio_total_return >= 0 else REPORT_RED,
+    )
+    add_metric_card(
+        fig,
+        0.29,
+        0.73,
+        0.20,
+        portfolio_result.benchmark_ticker,
+        format_percent(benchmark_total_return),
+        "Benchmark de mercado",
+        REPORT_GRAY,
+    )
+    add_metric_card(
+        fig,
+        0.51,
+        0.73,
+        0.20,
+        "Mejor Sharpe",
+        best_sharpe_row["Sector"],
+        f"Sharpe: {best_sharpe_row['Sharpe']:.2f}",
+        REPORT_BLUE,
+    )
+    add_metric_card(
+        fig,
+        0.73,
+        0.73,
+        0.20,
+        "Beta mas baja",
+        lowest_beta_row["Sector"],
+        f"Beta: {lowest_beta_row['Beta vs benchmark']:.2f}",
+        REPORT_GREEN,
+    )
+
+    ax_top = fig.add_axes([0.08, 0.34, 0.84, 0.35])
+    sector_colors = {
+        "Tech": REPORT_BLUE,
+        "Healthcare": REPORT_GREEN,
+        "Consumer Staples": REPORT_RED,
+        "Composite Portfolio": "#FFFFFF",
+        portfolio_result.benchmark_ticker: REPORT_GRAY,
+    }
+    sector_styles = {
+        "Tech": "solid",
+        "Healthcare": "solid",
+        "Consumer Staples": "solid",
+        "Composite Portfolio": "solid",
+        portfolio_result.benchmark_ticker: "dashed",
+    }
+
+    for sector in portfolio_result.sector_frame.columns:
+        ax_top.plot(
+            portfolio_result.sector_frame.index,
+            portfolio_result.sector_frame[sector],
+            color=sector_colors.get(sector, REPORT_BLUE),
+            linewidth=1.8,
+            linestyle=sector_styles.get(sector, "solid"),
+            alpha=0.85,
+            label=sector,
+        )
+
+    ax_top.plot(
+        portfolio_result.portfolio_wealth.index,
+        portfolio_result.portfolio_wealth,
+        color=REPORT_NAVY,
+        linewidth=2.8,
+        label="Equal-weight portfolio",
+    )
+    benchmark_wealth = portfolio_result.normalized_frame[portfolio_result.benchmark_ticker]
+    ax_top.plot(
+        benchmark_wealth.index,
+        benchmark_wealth,
+        color=REPORT_GRAY,
+        linewidth=2.0,
+        linestyle="--",
+        label=portfolio_result.benchmark_ticker,
+    )
+    ax_top.set_title("Crecimiento normalizado de sectores y benchmark", loc="left", fontsize=11, fontweight="bold", color=REPORT_NAVY)
+    ax_top.set_ylabel("Indice base 100")
+    ax_top.grid(True, alpha=0.18)
+    ax_top.spines[["top", "right"]].set_visible(False)
+    ax_top.legend(frameon=False, ncol=3, fontsize=8, loc="upper left")
+
+    ax_bottom = fig.add_axes([0.08, 0.12, 0.84, 0.16])
+    portfolio_corr = portfolio_result.portfolio_rolling_correlation.dropna()
+    ax_bottom.plot(portfolio_corr.index, portfolio_corr, color=REPORT_NAVY, linewidth=2.2, label="Equal-weight portfolio")
+    for sector in portfolio_result.rolling_correlation.columns:
+        corr_series = portfolio_result.rolling_correlation[sector].dropna()
+        ax_bottom.plot(corr_series.index, corr_series, linewidth=1.5, label=sector)
+    ax_bottom.axhline(0, color=REPORT_NAVY, linewidth=0.8)
+    ax_bottom.set_title("Correlacion movil contra el mercado", loc="left", fontsize=10.5, fontweight="bold", color=REPORT_NAVY)
+    ax_bottom.set_ylabel("Corr.")
+    ax_bottom.grid(True, alpha=0.18)
+    ax_bottom.spines[["top", "right"]].set_visible(False)
+    ax_bottom.legend(frameon=False, ncol=4, fontsize=7.8, loc="upper left")
+
+    add_text_block(
+        fig,
+        0.08,
+        0.03,
+        "Lectura",
+        (
+            "La diversificacion elimina riesgo idiosincratico e industrial, pero el riesgo sistematico permanece. "
+            "Cuando el mercado entra en tension, correlaciones y betas suelen subir; esa es la parte que el portfolio manager no puede ignorar."
+        ),
+        chars=138,
+        fontsize=8.2,
+        line_height=0.020,
+    )
+
+    add_report_footer(fig, "Portfolio overview")
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def add_portfolio_correlation_page(pdf, portfolio_result: PortfolioAnalyticsResult):
+    fig = make_report_figure()
+    add_report_header(
+        fig,
+        "Estructura de riesgo: correlacion y clustering",
+        "La matriz de correlacion muestra si la cartera esta diversificada de verdad o solo lo parece por agregacion.",
+        "Risk decomposition",
+    )
+
+    ax_heatmap = fig.add_axes([0.07, 0.26, 0.54, 0.56])
+    sns.heatmap(
+        portfolio_result.correlation_matrix,
+        ax=ax_heatmap,
+        cmap="coolwarm",
+        vmin=-1,
+        vmax=1,
+        center=0,
+        square=True,
+        cbar_kws={"shrink": 0.82, "label": "Correlation"},
+        linewidths=0.25,
+        linecolor="white",
+    )
+    ax_heatmap.set_title("Correlacion entre activos del universo", loc="left", fontsize=11, fontweight="bold", color=REPORT_NAVY)
+    ax_heatmap.tick_params(axis="x", rotation=45, labelsize=7)
+    ax_heatmap.tick_params(axis="y", rotation=0, labelsize=7)
+
+    summary_df = portfolio_result.sector_summary.copy()
+    display_df = summary_df[
+        [
+            "Sector",
+            "Total return %",
+            "Annualized vol %",
+            "Sharpe",
+            "Max drawdown %",
+            "Beta vs benchmark",
+        ]
+    ].copy()
+    display_df["Total return %"] = display_df["Total return %"].map(format_percent)
+    display_df["Annualized vol %"] = display_df["Annualized vol %"].map(format_percent)
+    display_df["Sharpe"] = display_df["Sharpe"].map(lambda value: f"{value:.2f}" if pd.notna(value) else "na")
+    display_df["Max drawdown %"] = display_df["Max drawdown %"].map(format_percent)
+    display_df["Beta vs benchmark"] = display_df["Beta vs benchmark"].map(lambda value: f"{value:.2f}" if pd.notna(value) else "na")
+
+    ax_table = fig.add_axes([0.64, 0.28, 0.29, 0.50])
+    ax_table.axis("off")
+    table = ax_table.table(
+        cellText=display_df.values,
+        colLabels=display_df.columns,
+        loc="center",
+        cellLoc="center",
+        colLoc="center",
+        bbox=[0, 0, 1, 1],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(7.0)
+    table.scale(1.0, 1.35)
+    for (row, column), cell in table.get_celld().items():
+        cell.set_edgecolor(REPORT_BORDER)
+        cell.set_linewidth(0.5)
+        if row == 0:
+            cell.set_facecolor(REPORT_NAVY)
+            cell.set_text_props(color="white", weight="bold")
+        else:
+            cell.set_facecolor(REPORT_LIGHT_GRAY if row % 2 == 0 else "white")
+            if column in (3, 5):
+                raw_value = summary_df.iloc[row - 1, summary_df.columns.get_loc("Sharpe" if column == 3 else "Beta vs benchmark")]
+                cell.set_text_props(color=REPORT_GREEN if raw_value >= 0 else REPORT_RED)
+
+    add_text_block(
+        fig,
+        0.64,
+        0.17,
+        "Lectura",
+        (
+            "Diversificar no elimina por completo el riesgo de mercado. La correlacion tiende a subir cuando el entorno se estresa, "
+            "por eso la matriz de correlacion debe revisarse junto con la beta y el drawdown."
+        ),
+        chars=88,
+        fontsize=8.3,
+        line_height=0.020,
+    )
+
+    add_report_footer(fig, "Portfolio risk")
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def add_portfolio_factor_page(pdf, portfolio_result: PortfolioAnalyticsResult):
+    fig = make_report_figure()
+    add_report_header(
+        fig,
+        "Factores de cartera: PCA y CAPM",
+        "La descomposicion espectral comprime la covarianza; CAPM traduce la exposicion sistematica a beta y alpha.",
+        "Factor view",
+    )
+
+    ax_scree = fig.add_axes([0.07, 0.52, 0.38, 0.30])
+    pcs = [f"PC{i + 1}" for i in range(len(portfolio_result.pca_eigenvalues))]
+    ax_scree.bar(pcs, portfolio_result.pca_eigenvalues, color=REPORT_BLUE, alpha=0.85)
+    ax_scree.set_title("Scree plot", loc="left", fontsize=11, fontweight="bold", color=REPORT_NAVY)
+    ax_scree.set_ylabel("Eigenvalue")
+    ax_scree.grid(axis="y", alpha=0.18)
+    ax_scree.spines[["top", "right"]].set_visible(False)
+
+    ax_cum = ax_scree.twinx()
+    ax_cum.plot(pcs, portfolio_result.pca_cumulative_variance_ratio, color=REPORT_GREEN, marker="o", linewidth=2.0)
+    ax_cum.set_ylim(0, 1.05)
+    ax_cum.set_ylabel("Cumulative explained variance")
+
+    ax_loadings = fig.add_axes([0.52, 0.46, 0.40, 0.36])
+    loading_subset = portfolio_result.pca_loadings.iloc[:, :3]
+    sns.heatmap(
+        loading_subset,
+        ax=ax_loadings,
+        cmap="vlag",
+        center=0,
+        annot=True,
+        fmt=".2f",
+        cbar_kws={"shrink": 0.78, "label": "Loading"},
+        linewidths=0.25,
+        linecolor="white",
+    )
+    ax_loadings.set_title("Loadings sobre las 3 primeras componentes", loc="left", fontsize=11, fontweight="bold", color=REPORT_NAVY)
+    ax_loadings.tick_params(axis="x", rotation=0, labelsize=7)
+    ax_loadings.tick_params(axis="y", rotation=0, labelsize=7)
+
+    capm_df = portfolio_result.capm_summary.copy()
+    display_df = capm_df[["Sector", "Beta", "Alpha annualized %", "R value"]].copy()
+    display_df["Beta"] = display_df["Beta"].map(lambda value: f"{value:.2f}" if pd.notna(value) else "na")
+    display_df["Alpha annualized %"] = display_df["Alpha annualized %"].map(lambda value: format_percent(value) if pd.notna(value) else "na")
+    display_df["R value"] = display_df["R value"].map(lambda value: f"{value:.2f}" if pd.notna(value) else "na")
+
+    ax_table = fig.add_axes([0.07, 0.12, 0.85, 0.20])
+    ax_table.axis("off")
+    table = ax_table.table(
+        cellText=display_df.values,
+        colLabels=display_df.columns,
+        loc="center",
+        cellLoc="center",
+        colLoc="center",
+        bbox=[0, 0, 1, 1],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(7.2)
+    table.scale(1.0, 1.3)
+    for (row, column), cell in table.get_celld().items():
+        cell.set_edgecolor(REPORT_BORDER)
+        cell.set_linewidth(0.5)
+        if row == 0:
+            cell.set_facecolor(REPORT_NAVY)
+            cell.set_text_props(color="white", weight="bold")
+        else:
+            cell.set_facecolor(REPORT_LIGHT_GRAY if row % 2 == 0 else "white")
+            if column == 1 and capm_df.iloc[row - 1]["Beta"] >= 0:
+                cell.set_text_props(color=REPORT_GREEN)
+            if column == 2 and capm_df.iloc[row - 1]["Alpha annualized %"] >= 0:
+                cell.set_text_props(color=REPORT_GREEN)
+
+    add_text_block(
+        fig,
+        0.07,
+        0.04,
+        "Lectura",
+        (
+            "La primera componente suele capturar la mayor parte de la varianza común. Beta mide exposicion al mercado; "
+            "alpha es el residuo. Si una estrategia depende de que el mercado suba para ganar, eso es beta, no alpha."
+        ),
+        chars=130,
+        fontsize=8.2,
+        line_height=0.020,
+    )
+
+    add_report_footer(fig, "Portfolio factors")
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
 def add_ticker_page(pdf, result):
     fig = make_report_figure()
-    change = result.median_return * 100
     status_accent = REPORT_GRAY if not result.rankable else REPORT_BLUE
     add_report_header(
         fig,
@@ -823,8 +1275,8 @@ def add_ticker_page(pdf, result):
         0.20,
         "Mediana",
         format_price(result.median_final_price),
-        f"{format_percent(change)} vs actual",
-        REPORT_GREEN if change >= 0 else REPORT_RED,
+        f"{format_percent(result.median_return * 100)} vs actual",
+        REPORT_GREEN if result.median_return >= 0 else REPORT_RED,
     )
     add_metric_card(
         fig,
@@ -869,7 +1321,7 @@ def add_ticker_page(pdf, result):
     plt.close(fig)
 
 
-def create_pdf_report(results, summary_df, output_path=REPORT_PATH):
+def create_pdf_report(results, summary_df, output_path=REPORT_PATH, portfolio_result=None):
     logger.info("Creating PDF report | path=%s", output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with PdfPages(output_path) as pdf:
@@ -881,6 +1333,16 @@ def create_pdf_report(results, summary_df, output_path=REPORT_PATH):
         add_summary_table_page(pdf, summary_df)
         logger.info("PDF page | risk-return")
         add_risk_return_page(pdf, summary_df)
+        if summary_df["Senal opcion ATM"].ne("SIN_OPCION").any():
+            logger.info("PDF page | options overlay")
+            add_option_overlay_page(pdf, summary_df)
+        if portfolio_result is not None:
+            logger.info("PDF page | portfolio overview")
+            add_portfolio_overview_page(pdf, portfolio_result)
+            logger.info("PDF page | portfolio correlation")
+            add_portfolio_correlation_page(pdf, portfolio_result)
+            logger.info("PDF page | portfolio factors")
+            add_portfolio_factor_page(pdf, portfolio_result)
         for result in results:
             logger.info("PDF page | ticker=%s", result.ticker)
             add_ticker_page(pdf, result)
@@ -911,7 +1373,9 @@ def run_single_ticker(ticker=SINGLE_TICKER):
 def run_multiple_tickers(tickers=None, output_path=REPORT_PATH):
     tickers = tickers or TICKERS
     logger.info("Running multi ticker workflow | tickers=%s", tickers)
-    data = get_stock_data(tickers, START_DATE)
+    portfolio_universe = list(dict.fromkeys([ticker for values in PORTFOLIO_SECTOR_MAP.values() for ticker in values] + [PORTFOLIO_BENCHMARK_TICKER]))
+    download_universe = list(dict.fromkeys(list(tickers) + portfolio_universe))
+    data = get_stock_data(download_universe, START_DATE)
     results = []
 
     for ticker in tickers:
@@ -920,11 +1384,22 @@ def run_multiple_tickers(tickers=None, output_path=REPORT_PATH):
         result = simulate_dynamic_gbm(close_prices, ticker, NUM_DAYS_MULTIPLE_TICKERS, NUM_SIMULATIONS)
         results.append(result)
 
+    portfolio_result = None
+    try:
+        portfolio_result = build_portfolio_analytics(
+            data,
+            sector_map=PORTFOLIO_SECTOR_MAP,
+            benchmark_ticker=PORTFOLIO_BENCHMARK_TICKER,
+            rolling_window=PORTFOLIO_ROLLING_WINDOW,
+        )
+    except Exception as exc:
+        logger.warning("Portfolio analysis unavailable: %s", exc)
+
     summary_df = summarize_results(results)
     print(f"\n--- Resumen consolidado ({NUM_DAYS_MULTIPLE_TICKERS} dias, {NUM_SIMULATIONS} simulaciones) ---")
     print(summary_df.to_string(index=False, float_format=lambda value: f"{value:,.4f}"))
 
-    report_path = create_pdf_report(results, summary_df, output_path=output_path)
+    report_path = create_pdf_report(results, summary_df, output_path=output_path, portfolio_result=portfolio_result)
     print(f"\nPDF generado: {report_path}")
 
     return summary_df
